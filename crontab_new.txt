@@ -1,0 +1,32 @@
+# Jay's Network - OmniMetrics Sync Jobs
+# Run as root on OmniMetrics LXC
+# Migrated to /opt/jaysnet/logistics-automation/jobs/legacy/ on 2026-09-10
+# All six scripts validated from new location before this swap — see chat log.
+# Originals archived at /opt/jaysnet/_archived_pre_migration/ (not deleted).
+
+# ADARS Tracking — every 10 minutes
+*/10 * * * * /usr/bin/python3 /opt/jaysnet/logistics-automation/jobs/legacy/Sync_ADARS.py >> /var/log/jaysnet/sync_adars.log 2>&1
+
+# WorldRisk Tracking — every 5 minutes (offset by 3min to stagger)
+3,8,13,18,23,28,33,38,43,48,53,58 * * * * /usr/bin/python3 /opt/jaysnet/logistics-automation/jobs/legacy/Sync_WorldRisk.py >> /var/log/jaysnet/sync_worldrisk.log 2>&1
+
+# Analytics sync — every 30 minutes (dormant — not touched)
+#*/30 * * * * /usr/bin/python3 /opt/jaysnet/sync_analytics.py >> /var/log/jaysnet/sync_analytics.log 2>&1
+
+# Dashboard sync — every 60 minutes (dormant — not touched)
+#0 * * * * /usr/bin/python3 /opt/jaysnet/sync_dashboard.py >> /var/log/jaysnet/sync_dashboard.log 2>&1
+
+# Global Scanner — once daily at 2am (dormant — not touched)
+#0 2 * * * /usr/bin/python3 /opt/jaysnet/Global_Scanner.py >> /var/log/jaysnet/global_scanner.log 2>&1
+
+# Border Bot — status + attachment check every 10 min
+6,16,26,36,46,56 * * * * /usr/bin/python3 /opt/jaysnet/logistics-automation/jobs/legacy/check_border_overdue.py >> /var/log/jaysnet/border_bot_cron.log 2>&1
+
+#police bot 
+*/5 * * * * /usr/bin/python3 /opt/jaysnet/logistics-automation/jobs/legacy/police_bot.py >> /var/log/jaysnet/police_bot.log 2>&1
+
+#master sheet
+2,7,12,17,22,27,32,37,42,47,52,57 * * * * /usr/bin/python3 /opt/jaysnet/logistics-automation/jobs/legacy/Sync_MasterRotation.py >> /var/log/jaysnet/sync_master_rotation.log 2>&1
+
+#ADARS Finaces
+* * * * * /usr/bin/python3 /opt/jaysnet/logistics-automation/jobs/legacy/Sync_Finance.py >> /var/log/jaysnet/finance_sync.log 2>&1

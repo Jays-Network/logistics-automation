@@ -1,0 +1,6 @@
+smartsheet-python-sdk
+python-dotenv
+psycopg2-binary
+requests
+python-dateutil
+python-telegram-bot
