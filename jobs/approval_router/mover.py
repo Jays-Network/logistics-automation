@@ -189,6 +189,25 @@ def get_move_log(conn, move_log_id: int) -> dict[str, Any] | None:
         return cur.fetchone()
 
 
+def _values_equivalent(original_value: Any, moved_value: Any) -> bool:
+    """
+    True if two cell values should be treated as the same for verification
+    purposes. Handles one confirmed real-world quirk: a blank CHECKBOX cell
+    reads back as None via row_to_dict() on the source sheet, but the same
+    logical "unchecked" state reads back as an explicit False once it lands
+    on the target sheet after a move. Confirmed live 2026-09-13 across
+    multiple real moves (Glencore International, Goldvale) — this is not a
+    real data-loss mismatch, just how Smartsheet represents an empty
+    checkbox on read vs. write. Every other type of value still needs an
+    exact match.
+    """
+    if original_value == moved_value:
+        return True
+    if (original_value is None and moved_value is False) or (original_value is False and moved_value is None):
+        return True
+    return False
+
+
 def _diff_row_data(original: dict[str, Any], moved: dict[str, Any],
                     target_column_titles: set[str],
                     ignore_columns=DEFAULT_IGNORE_COLUMNS) -> tuple[list[tuple[str, Any, Any]], int]:
@@ -215,7 +234,7 @@ def _diff_row_data(original: dict[str, Any], moved: dict[str, Any],
             skipped += 1
             continue
         moved_value = moved.get(col_name)
-        if original_value != moved_value:
+        if not _values_equivalent(original_value, moved_value):
             mismatches.append((col_name, original_value, moved_value))
     return mismatches, skipped
 
