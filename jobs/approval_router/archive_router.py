@@ -108,7 +108,7 @@ def _deactivate_and_insert_archive(conn, client_slug: str, old_sheet_id: int,
                                     new_sheet_id: int, new_sheet_name: str):
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE approval_router_archive_state SET is_active = false, deactivated_at = now() "
+            "UPDATE approval_router_archive_state SET is_active = false, deactivated_at = clock_timestamp() "
             "WHERE client_slug = %s AND sheet_id = %s AND is_active = true",
             (client_slug, old_sheet_id),
         )
@@ -348,7 +348,8 @@ JOB_NAME = "archive_router_part2"
 def _start_job_run(conn, job_name: str) -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO automation_job_run_log (job_name, status) VALUES (%s, 'running') RETURNING id",
+            "INSERT INTO automation_job_run_log (job_name, status, started_at) "
+            "VALUES (%s, 'running', clock_timestamp()) RETURNING id",
             (job_name,),
         )
         job_run_id = cur.fetchone()[0]
@@ -357,10 +358,22 @@ def _start_job_run(conn, job_name: str) -> int:
 
 
 def _finish_job_run(conn, job_run_id: int, status: str, rows_processed: int, error_message: str | None = None):
+    """
+    Uses clock_timestamp() rather than now() for finished_at -- confirmed
+    live 2026-09-14 that now() returns the current TRANSACTION's start
+    time in Postgres, not real wall-clock time. Two real runs that moved
+    0 rows (meaning zero commit() calls happened anywhere inside
+    process_client_archive(), so the whole run stayed in one long-lived
+    transaction) both logged a finished_at only ~1.1s after started_at,
+    even though the run genuinely took ~52s end to end. clock_timestamp()
+    is immune to this -- it always reflects the actual moment the
+    statement executes, regardless of how long the surrounding
+    transaction has been open.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE automation_job_run_log SET status = %s, rows_processed = %s, "
-            "error_message = %s, finished_at = now() WHERE id = %s",
+            "error_message = %s, finished_at = clock_timestamp() WHERE id = %s",
             (status, rows_processed, error_message, job_run_id),
         )
     conn.commit()

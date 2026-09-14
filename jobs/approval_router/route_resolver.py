@@ -379,7 +379,8 @@ JOB_NAME = "route_resolver_part1"
 def _start_job_run(conn, job_name: str) -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO automation_job_run_log (job_name, status) VALUES (%s, 'running') RETURNING id",
+            "INSERT INTO automation_job_run_log (job_name, status, started_at) "
+            "VALUES (%s, 'running', clock_timestamp()) RETURNING id",
             (job_name,),
         )
         job_run_id = cur.fetchone()[0]
@@ -388,10 +389,19 @@ def _start_job_run(conn, job_name: str) -> int:
 
 
 def _finish_job_run(conn, job_run_id: int, status: str, rows_processed: int, error_message: str | None = None):
+    """
+    Uses clock_timestamp() rather than now() for finished_at -- confirmed
+    live 2026-09-14 (found in archive_router.py, applied here defensively
+    for the same identical code pattern) that now() returns the current
+    TRANSACTION's start time in Postgres, not real wall-clock time. A run
+    with zero commit() calls between start and finish stays in one
+    long-lived transaction, making now() at the end look like it happened
+    right at the start. clock_timestamp() is immune to this.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE automation_job_run_log SET status = %s, rows_processed = %s, "
-            "error_message = %s, finished_at = now() WHERE id = %s",
+            "error_message = %s, finished_at = clock_timestamp() WHERE id = %s",
             (status, rows_processed, error_message, job_run_id),
         )
     conn.commit()
