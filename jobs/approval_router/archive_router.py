@@ -256,12 +256,42 @@ def _rotate_archive_sheet(conn, ss_client, client_slug: str, full_sheet_id: int,
     return new_sheet_id
 
 
+def _get_archive_sheet_state(conn, sheet_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_version, last_checkpoint_at FROM archive_router_sheet_state WHERE sheet_id = %s",
+            (sheet_id,),
+        )
+        return cur.fetchone()
+
+
+def _update_archive_sheet_state(conn, sheet_id: int, client_slug: str, version: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO archive_router_sheet_state (sheet_id, client_slug, last_version, last_checkpoint_at) "
+            "VALUES (%s, %s, %s, clock_timestamp()) "
+            "ON CONFLICT (sheet_id) DO UPDATE SET client_slug = EXCLUDED.client_slug, "
+            "last_version = EXCLUDED.last_version, last_checkpoint_at = EXCLUDED.last_checkpoint_at",
+            (sheet_id, client_slug, version),
+        )
+    conn.commit()
+
+
 def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug: str, folder_id: int) -> dict[str, int]:
     """
     Scans every non-archive sheet in a client's invoicing folder for rows
     with the Archive checkbox checked, and moves each one to the client's
     active archive sheet. Handles full-sheet rotation transparently — the
     caller doesn't need to know a rotation happened mid-run.
+
+    DELTA (2026-09-14): a cheap Sheets.get_sheet_version() check per sheet
+    skips the full row-fetch entirely for sheets that haven't changed
+    since the last run. Once fetched, only rows changed since our last
+    check are evaluated. No "pending unresolved" tracking needed here the
+    way route_resolver.py/main_to_contractor.py got one -- the one known
+    failure mode (a full archive target) already self-heals via automatic
+    rotation within this same call, so nothing is left waiting on an
+    external fix across runs.
     """
     stats = {"sheets_checked": 0, "rows_checked": 0, "rows_moved": 0, "rotations": 0}
 
@@ -274,6 +304,14 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
     for sheet_summary in sheets_in_folder:
         if sheet_summary.id == archive_sheet_id:
             continue  # never scan the archive sheet itself as a source
+
+        current_version = ss_client.Sheets.get_sheet_version(sheet_summary.id).version
+        state = _get_archive_sheet_state(conn, sheet_summary.id)
+        last_version, last_checkpoint_at = state if state else (None, None)
+
+        if last_version is not None and current_version == last_version:
+            continue  # unchanged since last check, nothing to do here
+
         stats["sheets_checked"] += 1
 
         sheet = ss_client.Sheets.get_sheet(sheet_summary.id)
@@ -284,9 +322,13 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
             None,
         )
         if archive_col_id is None:
+            _update_archive_sheet_state(conn, sheet_summary.id, client_slug, current_version)
             continue  # no Archive column on this sheet — skip silently, not every sheet needs one
 
         for row in sheet.rows:
+            if last_checkpoint_at is not None and row.modified_at and row.modified_at <= last_checkpoint_at:
+                continue  # this specific row hasn't changed since our last check
+
             stats["rows_checked"] += 1
             cells_by_col = {cell.column_id: cell for cell in row.cells}
             archive_cell = cells_by_col.get(archive_col_id)
@@ -337,6 +379,8 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
                 )
 
             stats["rows_moved"] += 1
+
+        _update_archive_sheet_state(conn, sheet_summary.id, client_slug, current_version)
 
     return stats
 

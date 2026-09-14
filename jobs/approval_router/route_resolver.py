@@ -54,7 +54,7 @@ import psycopg2.extras
 load_dotenv()
 
 from jobs.approval_router.backup import get_connection, row_to_dict
-from jobs.approval_router.mover import get_smartsheet_client, move_row, MoverError
+from jobs.approval_router.mover import get_smartsheet_client, move_row, MoverError, get_move_log, SHEET_FULL_ERROR_CODE
 
 logger = logging.getLogger("approval_router.route_resolver")
 
@@ -301,13 +301,92 @@ def _alert_unresolvable_route(conn, client_slug: str, route_value: str,
     conn.commit()
 
 
-def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slug: str, main_sheet_id: int) -> dict[str, int]:
+def _get_unresolved_rows(conn, main_sheet_id: int) -> set[int]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT source_row_id FROM approval_router_unresolved_route_log WHERE source_sheet_id = %s",
+            (main_sheet_id,),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
+def _upsert_unresolved(conn, main_sheet_id: int, source_row_id: int, client_slug: str,
+                        route_value: str, reason: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO approval_router_unresolved_route_log "
+            "(source_sheet_id, source_row_id, client_slug, route_value, reason, last_checked_at) "
+            "VALUES (%s, %s, %s, %s, %s, clock_timestamp()) "
+            "ON CONFLICT (source_sheet_id, source_row_id) DO UPDATE SET "
+            "route_value = EXCLUDED.route_value, reason = EXCLUDED.reason, "
+            "last_checked_at = EXCLUDED.last_checked_at",
+            (main_sheet_id, source_row_id, client_slug, route_value, reason),
+        )
+    conn.commit()
+
+
+def _clear_unresolved(conn, main_sheet_id: int, source_row_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM approval_router_unresolved_route_log WHERE source_sheet_id = %s AND source_row_id = %s",
+            (main_sheet_id, source_row_id),
+        )
+    conn.commit()
+
+
+def _get_sheet_delta_state(conn, sheet_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_version, last_checkpoint_at FROM approval_router_sync_sheet_state WHERE sheet_id = %s",
+            (sheet_id,),
+        )
+        return cur.fetchone()
+
+
+def _update_sheet_delta_state(conn, sheet_id: int, client_slug: str, sheet_name: str, version: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO approval_router_sync_sheet_state "
+            "(sheet_id, client_slug, sheet_name, last_version, last_checkpoint_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, clock_timestamp(), clock_timestamp()) "
+            "ON CONFLICT (sheet_id) DO UPDATE SET client_slug = EXCLUDED.client_slug, "
+            "sheet_name = EXCLUDED.sheet_name, last_version = EXCLUDED.last_version, "
+            "last_checkpoint_at = EXCLUDED.last_checkpoint_at, updated_at = EXCLUDED.updated_at",
+            (sheet_id, client_slug, sheet_name, version),
+        )
+    conn.commit()
+
+
+def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slug: str, main_sheet_id: int,
+                   known_bad_targets_this_run: set) -> dict[str, int]:
     """
     Checks one client's main sheet for approved, routed rows and moves them.
     Returns a small stats dict for logging. Never raises for a single bad
     row — logs and continues, same philosophy as mover.py.
+
+    DELTA (2026-09-14): skips the full sheet fetch entirely if the sheet's
+    version is unchanged since last run AND there are no rows in
+    approval_router_unresolved_route_log for this sheet (those need
+    re-checking regardless -- the fix for an unresolvable route is usually
+    external, e.g. creating the missing target sheet, and never touches
+    the source row/sheet). Once fetched, only rows that changed OR are in
+    that pending-unresolved set get evaluated.
+
+    known_bad_targets_this_run: shared across all clients in one run --
+    if a target sheet turns out to be full, every other row destined for
+    it this run is skipped immediately instead of individually retried.
     """
-    stats = {"rows_checked": 0, "rows_moved": 0, "rows_skipped_no_route": 0, "rows_skipped_not_approved": 0, "rows_failed_resolve": 0}
+    stats = {"rows_checked": 0, "rows_moved": 0, "rows_skipped_no_route": 0,
+              "rows_skipped_not_approved": 0, "rows_failed_resolve": 0, "skipped_known_bad_target": 0}
+
+    unresolved_rows = _get_unresolved_rows(conn, main_sheet_id)
+    current_version = ss_client.Sheets.get_sheet_version(main_sheet_id).version
+    state = _get_sheet_delta_state(conn, main_sheet_id)
+    last_version, last_checkpoint_at = state if state else (None, None)
+
+    if last_version is not None and current_version == last_version and not unresolved_rows:
+        logger.info("%s: unchanged (version %s), no pending unresolved rows — skipping", client_slug, current_version)
+        return stats
 
     sheet = ss_client.Sheets.get_sheet(main_sheet_id)
     columns_by_id = {c.id: c.title for c in sheet.columns}
@@ -324,6 +403,10 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
         return stats
 
     for row in sheet.rows:
+        row_changed = last_checkpoint_at is None or (row.modified_at and row.modified_at > last_checkpoint_at)
+        if not row_changed and row.id not in unresolved_rows:
+            continue
+
         stats["rows_checked"] += 1
         cells_by_col = {cell.column_id: cell for cell in row.cells}
 
@@ -354,6 +437,13 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
                 row.id, client_slug, route_value, local_route_value, reason,
             )
             _alert_unresolvable_route(conn, client_slug, route_value, local_route_value, reason)
+            _upsert_unresolved(conn, main_sheet_id, row.id, client_slug, route_value, reason)
+            continue
+
+        _clear_unresolved(conn, main_sheet_id, row.id)
+
+        if target_sheet_id in known_bad_targets_this_run:
+            stats["skipped_known_bad_target"] += 1
             continue
 
         move_log_id = move_row(
@@ -366,9 +456,14 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
             route_value=route_value,
             mine_value=local_route_value,
         )
+        move_log = get_move_log(conn, move_log_id)
+        if move_log and move_log["status"] == "error" and move_log.get("error_code") == SHEET_FULL_ERROR_CODE:
+            known_bad_targets_this_run.add(target_sheet_id)
+            logger.warning("Target sheet %s marked bad for the rest of this run", target_sheet_id)
         stats["rows_moved"] += 1
         logger.info("Row %s on %s moved (ROUTE=%r) -> move_log_id=%s", row.id, client_slug, route_value, move_log_id)
 
+    _update_sheet_delta_state(conn, main_sheet_id, client_slug, sheet.name, current_version)
     return stats
 
 
@@ -437,6 +532,7 @@ def main():
     job_run_id = None
     total_rows_moved = 0
     start_time = time.time()
+    known_bad_targets_this_run = set()
 
     try:
         conn = get_connection()
@@ -446,7 +542,7 @@ def main():
 
         for client_slug, config in MAIN_SHEETS.items():
             try:
-                stats = process_sheet(conn, ss_client, folder_cache, client_slug, config["main_sheet_id"])
+                stats = process_sheet(conn, ss_client, folder_cache, client_slug, config["main_sheet_id"], known_bad_targets_this_run)
                 total_rows_moved += stats["rows_moved"]
                 logger.info("Client %s done: %s", client_slug, stats)
             except Exception as exc:

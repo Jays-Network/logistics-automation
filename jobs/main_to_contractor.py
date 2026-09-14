@@ -1,31 +1,42 @@
 """
 main_to_contractor.py — Main sheet -> Contractor sheet (COPY, not move)
 
-Confirmed with Jay 2026-09-14 (Wednesday 4pm deadline, time-constrained
-build): a row's per-region SUBMIT checkbox (e.g. "ZAM: SUBMIT",
-"DRC: SUBMIT") on any of the 12 client main sheets is the trigger to COPY
-that row to the matching contractor sheet in the Contractors workspace.
-The specific contractor company name in the target sheet's title is
-irrelevant/arbitrary internal naming (confirmed explicitly) -- only the
+Confirmed with Jay 2026-09-14: a row's per-region SUBMIT checkbox (e.g.
+"ZAM: SUBMIT", "DRC: SUBMIT") on any of the 12 client main sheets is the
+trigger to COPY that row to the matching contractor sheet in the
+Contractors workspace. The specific contractor company name in the
+target sheet's title is irrelevant/arbitrary internal naming -- only the
 REGION matters, and every contractor sheet currently maps 1:1 to a
-region. A row can have more than one region checked; per Jay, that means
-copying to every matching contractor sheet, not just one.
+region. A row can have more than one region checked; that means copying
+to every matching contractor sheet, not just one.
 
-Idempotency: since nothing gets unchecked or removed after a copy
-(unlike Part 1/Part 2's move-based pipelines), re-scanning the same row
-on every cron tick would re-copy it forever without a dedup mechanism.
-Migration 011 adds main_to_contractor_copy_log with a unique index on
-(source_sheet_id, source_row_id, region_code) -- checked before every
-copy attempt.
+RETRY SEMANTICS (revised 2026-09-14 after a real production incident):
+a failed copy (e.g. target sheet full) is retried on every SCHEDULED run
+until it succeeds or a human clears it -- it is NOT permanently skipped.
+main_to_contractor_copy_log is an upsert keyed on
+(source_sheet_id, source_row_id, region_code): its status just reflects
+the most recent attempt, flipping to 'copied' once it finally succeeds.
 
-MAL (Malawi) has a SUBMIT checkbox on the main sheets but NO contractor
-sheet exists for it yet -- rows with MAL: SUBMIT checked are logged and
-alerted, not silently dropped, same fail-safe philosophy as the rest of
-this codebase.
+The real problem this revealed wasn't cross-run retrying (once every 10
+minutes is fine) -- it was retrying the SAME already-known-bad target
+dozens of times WITHIN one run, back to back. That's fixed with an
+in-memory "known bad target this run" set: the first SHEET_FULL_ERROR_CODE
+failure against a target blacklists it for the rest of THIS run only:
+every other row destined for that same target is skipped immediately
+(no API call at all) instead of being individually retried and failing.
+The next scheduled run starts with a clean slate and tries again.
 
-NOT YET LIVE-TESTED (time-constrained build) -- needs the same kind of
-live dry run every other piece of this system got before being trusted
-on cron.
+DELTA (2026-09-14): scanning every row on every sheet every 10 minutes
+doesn't scale. Two-tier check before doing real work:
+  1. Sheet-level: Sheets.get_sheet_version() (cheap, no row data) -- skip
+     the full fetch entirely if unchanged AND there are no rows in
+     main_to_contractor_copy_log with status='error' for this sheet
+     (those need re-checking regardless of whether the sheet itself
+     changed, since the fix is often external -- e.g. we create the
+     missing contractor sheet -- and never touches the source row).
+  2. Row-level: once fetched, a row is only evaluated if its own
+     modified_at is newer than our last check, OR it has a pending
+     'error' entry that needs retrying.
 """
 
 import os
@@ -40,7 +51,7 @@ load_dotenv()
 
 from jobs.approval_router.backup import get_connection
 from jobs.approval_router.mover import get_smartsheet_client
-from jobs.approval_router.copier import copy_row, CopierError
+from jobs.approval_router.copier import copy_row, CopierError, SHEET_FULL_ERROR_CODE
 from jobs.approval_router.route_resolver import MAIN_SHEETS
 
 logger = logging.getLogger("main_to_contractor")
@@ -61,8 +72,8 @@ REGION_TO_CONTRACTOR_SHEET: dict[str, int] = {
     "ZIM": 4599803954548612,   # Zimbabwe
 }
 # MAL (Malawi) has a SUBMIT checkbox on main sheets but no contractor
-# sheet yet -- deliberately absent from the map above so it's caught by
-# the "unmapped region" path below instead of silently matched.
+# sheet yet -- deliberately absent so it's caught by the "unmapped
+# region" path below instead of silently matched.
 
 JOB_NAME = "main_to_contractor"
 
@@ -79,34 +90,41 @@ def _find_submit_columns(columns_by_id: dict[int, str]) -> dict[int, str]:
     return result
 
 
-def _already_attempted(conn, source_sheet_id: int, source_row_id: int, region_code: str) -> bool:
-    """
-    True if this row+region has EVER been attempted before, regardless of
-    outcome -- confirmed live 2026-09-14 this needs to include 'error' as
-    well as 'copied': SPD DRC was already full in production, and without
-    this, every single cron run would re-attempt every already-failed
-    DRC row forever (hammering the API with the same 5636 error on
-    repeat). A failed attempt now stays failed until a human clears it
-    (e.g. deletes the error row after fixing the target sheet), same
-    "logged, not silently retried" philosophy as the rest of this
-    codebase's error handling.
-    """
+def _get_copied_set(conn, main_sheet_id: int) -> set[tuple[int, str]]:
+    """Rows already successfully copied -- permanent skip, never retried."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT 1 FROM main_to_contractor_copy_log "
-            "WHERE source_sheet_id = %s AND source_row_id = %s AND region_code = %s",
-            (source_sheet_id, source_row_id, region_code),
+            "SELECT source_row_id, region_code FROM main_to_contractor_copy_log "
+            "WHERE source_sheet_id = %s AND status = 'copied'",
+            (main_sheet_id,),
         )
-        return cur.fetchone() is not None
+        return set(cur.fetchall())
 
 
-def _log_copy(conn, source_sheet_id, source_row_id, region_code, target_sheet_id,
-              target_row_id, client_slug, status, error_message=None):
+def _get_pending_error_set(conn, main_sheet_id: int) -> set[tuple[int, str]]:
+    """Rows that failed last time and still need retrying -- forces
+    evaluation even if the row itself hasn't changed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT source_row_id, region_code FROM main_to_contractor_copy_log "
+            "WHERE source_sheet_id = %s AND status = 'error'",
+            (main_sheet_id,),
+        )
+        return set(cur.fetchall())
+
+
+def _upsert_copy_log(conn, source_sheet_id, source_row_id, region_code, target_sheet_id,
+                      target_row_id, client_slug, status, error_message=None):
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO main_to_contractor_copy_log "
             "(source_sheet_id, source_row_id, region_code, target_sheet_id, target_row_id, "
-            "client_slug, status, error_message) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            "client_slug, status, error_message, copied_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp()) "
+            "ON CONFLICT (source_sheet_id, source_row_id, region_code) DO UPDATE SET "
+            "target_sheet_id = EXCLUDED.target_sheet_id, target_row_id = EXCLUDED.target_row_id, "
+            "status = EXCLUDED.status, error_message = EXCLUDED.error_message, "
+            "copied_at = EXCLUDED.copied_at",
             (source_sheet_id, source_row_id, region_code, target_sheet_id, target_row_id,
              client_slug, status, error_message),
         )
@@ -149,17 +167,57 @@ def _alert_unmapped_region(conn, client_slug: str, source_row_id: int, region_co
     conn.commit()
 
 
-def process_sheet(conn, ss_client, client_slug: str, main_sheet_id: int) -> dict[str, int]:
-    stats = {"rows_checked": 0, "copies_made": 0, "already_copied": 0, "unmapped_region": 0, "errors": 0}
+def _get_sheet_state(conn, main_sheet_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_version, last_checked_at FROM main_to_contractor_sheet_state WHERE main_sheet_id = %s",
+            (main_sheet_id,),
+        )
+        return cur.fetchone()
+
+
+def _update_sheet_state(conn, main_sheet_id: int, version: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO main_to_contractor_sheet_state (main_sheet_id, last_version, last_checked_at) "
+            "VALUES (%s, %s, clock_timestamp()) "
+            "ON CONFLICT (main_sheet_id) DO UPDATE SET last_version = EXCLUDED.last_version, "
+            "last_checked_at = EXCLUDED.last_checked_at",
+            (main_sheet_id, version),
+        )
+    conn.commit()
+
+
+def process_sheet(conn, ss_client, client_slug: str, main_sheet_id: int,
+                   known_bad_targets_this_run: set) -> dict[str, int]:
+    stats = {"rows_checked": 0, "copies_made": 0, "already_copied": 0,
+              "unmapped_region": 0, "errors": 0, "skipped_known_bad_target": 0}
+
+    pending_errors = _get_pending_error_set(conn, main_sheet_id)
+    already_copied = _get_copied_set(conn, main_sheet_id)
+
+    current_version = ss_client.Sheets.get_sheet_version(main_sheet_id).version
+    state = _get_sheet_state(conn, main_sheet_id)
+    last_version, last_checked_at = state if state else (None, None)
+
+    if last_version is not None and current_version == last_version and not pending_errors:
+        logger.info("%s: unchanged (version %s), no pending errors — skipping", client_slug, current_version)
+        return stats
 
     sheet = ss_client.Sheets.get_sheet(main_sheet_id)
     columns_by_id = {c.id: c.title for c in sheet.columns}
     submit_columns = _find_submit_columns(columns_by_id)
 
     if not submit_columns:
+        _update_sheet_state(conn, main_sheet_id, current_version)
         return stats
 
     for row in sheet.rows:
+        row_has_pending = any((row.id, region) in pending_errors for region in submit_columns.values())
+        row_changed = last_checked_at is None or (row.modified_at and row.modified_at > last_checked_at)
+        if not row_changed and not row_has_pending:
+            continue
+
         stats["rows_checked"] += 1
         cells_by_col = {cell.column_id: cell for cell in row.cells}
 
@@ -168,7 +226,7 @@ def process_sheet(conn, ss_client, client_slug: str, main_sheet_id: int) -> dict
             if not cell or cell.value is not True:
                 continue
 
-            if _already_attempted(conn, main_sheet_id, row.id, region_code):
+            if (row.id, region_code) in already_copied:
                 stats["already_copied"] += 1
                 continue
 
@@ -177,23 +235,31 @@ def process_sheet(conn, ss_client, client_slug: str, main_sheet_id: int) -> dict
                 stats["unmapped_region"] += 1
                 logger.warning("Unmapped region %r for row %s on %s", region_code, row.id, client_slug)
                 _alert_unmapped_region(conn, client_slug, row.id, region_code)
-                _log_copy(conn, main_sheet_id, row.id, region_code, None, None, client_slug,
-                          "error", f"No contractor sheet mapped for region {region_code!r}")
+                _upsert_copy_log(conn, main_sheet_id, row.id, region_code, None, None, client_slug,
+                                  "error", f"No contractor sheet mapped for region {region_code!r}")
+                continue
+
+            if target_sheet_id in known_bad_targets_this_run:
+                stats["skipped_known_bad_target"] += 1
                 continue
 
             try:
                 target_row_id = copy_row(ss_client, main_sheet_id, row.id, target_sheet_id)
-                _log_copy(conn, main_sheet_id, row.id, region_code, target_sheet_id,
-                          target_row_id, client_slug, "copied")
+                _upsert_copy_log(conn, main_sheet_id, row.id, region_code, target_sheet_id,
+                                  target_row_id, client_slug, "copied")
                 stats["copies_made"] += 1
                 logger.info("Copied row %s (%s) on %s -> contractor sheet %s (target_row=%s)",
                             row.id, region_code, client_slug, target_sheet_id, target_row_id)
             except CopierError as exc:
                 stats["errors"] += 1
                 logger.error("Copy failed for row %s (%s) on %s: %s", row.id, region_code, client_slug, exc)
-                _log_copy(conn, main_sheet_id, row.id, region_code, target_sheet_id, None,
-                          client_slug, "error", str(exc))
+                _upsert_copy_log(conn, main_sheet_id, row.id, region_code, target_sheet_id, None,
+                                  client_slug, "error", str(exc))
+                if exc.error_code == SHEET_FULL_ERROR_CODE:
+                    known_bad_targets_this_run.add(target_sheet_id)
+                    logger.warning("Target sheet %s marked bad for the rest of this run", target_sheet_id)
 
+    _update_sheet_state(conn, main_sheet_id, current_version)
     return stats
 
 
@@ -240,6 +306,7 @@ def main():
     job_run_id = None
     total_copies = 0
     start_time = time.time()
+    known_bad_targets_this_run = set()
 
     try:
         conn = get_connection()
@@ -248,7 +315,7 @@ def main():
 
         for client_slug, config in MAIN_SHEETS.items():
             try:
-                stats = process_sheet(conn, ss_client, client_slug, config["main_sheet_id"])
+                stats = process_sheet(conn, ss_client, client_slug, config["main_sheet_id"], known_bad_targets_this_run)
                 total_copies += stats["copies_made"]
                 logger.info("Client %s done: %s", client_slug, stats)
             except Exception as exc:

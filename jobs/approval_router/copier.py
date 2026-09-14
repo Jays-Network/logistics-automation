@@ -23,6 +23,11 @@ import smartsheet
 
 logger = logging.getLogger("approval_router.copier")
 
+# Confirmed live 2026-09-10 (mover.py) and re-confirmed 2026-09-14 against
+# SPD DRC actually being full in production: Smartsheet's errorCode for a
+# cell-limit-exceeded target sheet.
+SHEET_FULL_ERROR_CODE = 5636
+
 
 class CopierError(Exception):
     """Raised for a Smartsheet-side failure during a copy. Never involves
