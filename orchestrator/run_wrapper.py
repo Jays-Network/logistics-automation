@@ -153,10 +153,12 @@ def main():
         sys.exit(2)
 
     conn = None
+    conn_lock = threading.Lock()
     run_id = None
     try:
         conn = get_connection()
-        run_id = _start_run(conn, args.job_name, args.trigger)
+        with conn_lock:
+            run_id = _start_run(conn, args.job_name, args.trigger)
     except Exception as exc:
         # If we can't even reach the DB, don't block the actual job from
         # running -- tracking is a nice-to-have, the job itself is not.
@@ -175,26 +177,24 @@ def main():
     stdout_capture.start()
     stderr_capture.start()
 
+    live_thread = None
     if conn and run_id:
         stop_live_updates = threading.Event()
 
         def _live_update_loop():
-            # Uses its own connection -- psycopg2 connections aren't safe
-            # for concurrent use across threads, and this runs alongside
-            # the main thread's eventual final write.
-            try:
-                live_conn = get_connection()
-            except Exception as exc:
-                logger.error("Live-update thread could not connect: %s", exc)
-                return
-            try:
-                while not stop_live_updates.wait(LIVE_UPDATE_INTERVAL_SECONDS):
-                    try:
-                        _update_live_tail(live_conn, run_id, stdout_capture.tail(), stderr_capture.tail())
-                    except Exception as exc:
-                        logger.error("Live tail update failed for %s: %s", args.job_name, exc)
-            finally:
-                live_conn.close()
+            # Shares the same connection as the main thread (down from a
+            # separate connection each, per Jay 2026-09-15: no reason for
+            # 2 separate Gatekeeper handshakes for one wrapper run) --
+            # conn_lock ensures the two threads never actually execute a
+            # query on it at the same time, which is the real requirement
+            # for sharing a psycopg2 connection across threads, not
+            # needing a second connection entirely.
+            while not stop_live_updates.wait(LIVE_UPDATE_INTERVAL_SECONDS):
+                try:
+                    with conn_lock:
+                        _update_live_tail(conn, run_id, stdout_capture.tail(), stderr_capture.tail())
+                except Exception as exc:
+                    logger.error("Live tail update failed for %s: %s", args.job_name, exc)
 
         live_thread = threading.Thread(target=_live_update_loop, daemon=True)
         live_thread.start()
@@ -204,9 +204,17 @@ def main():
     stderr_capture.join()
 
     if conn and run_id:
-        stop_live_updates.set()
+        if live_thread:
+            # Stop and properly wait for the live-update thread to fully
+            # exit its loop before the final write -- previously this
+            # wasn't joined, a benign race (separate connections meant no
+            # corruption either way) but worth doing correctly now that
+            # both threads share one connection.
+            stop_live_updates.set()
+            live_thread.join()
         try:
-            _finish_run(conn, run_id, exit_code, stdout_capture.tail(), stderr_capture.tail())
+            with conn_lock:
+                _finish_run(conn, run_id, exit_code, stdout_capture.tail(), stderr_capture.tail())
         except Exception as exc:
             logger.error("Could not record completion for %s: %s", args.job_name, exc)
         finally:
