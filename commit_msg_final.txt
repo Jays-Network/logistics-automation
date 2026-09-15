@@ -1,9 +1,0 @@
-Orchestrator: reflect police_bot_db.py reorg (moved to dormant/) alongside run_wrapper.py connection fix
-
-run_wrapper.py: the earlier fix (live-update thread sharing one
-connection with the main thread instead of opening its own, cutting
-Gatekeeper handshakes per run from 3 to 2) confirmed live and committed
-here.
-
-jobs/legacy/police_bot_db.py moved to jobs/legacy/dormant/ -- Jay's own
-reorg, reflects that it's not an independently-scheduled job.
