@@ -1,26 +1,84 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  /* True OLED black -- per Jay, navy-tinted dark reads worse than
+     genuine #000. Panels get the barest lift off black, just enough
+     to separate surfaces without ever reading as "navy". */
+  --color-void: #000000;
+  --color-panel: #0a0a0a;
+  --color-panel-raised: #131313;
+  --color-hairline: #1f1f1f;
+
+  --color-ink: #ededed;
+  --color-ink-muted: #8a8a8a;
+  --color-ink-dim: #4a4a4a;
+
+  /* Brand colors sampled directly from the OmniOrchestrator logo's
+     Python mark -- cyan-blue fading to magenta. Used only for brand
+     chrome (logo, wordmark, primary actions/links) -- status colors
+     below stay semantically distinct (red=bad, green=good is a
+     universal convention that shouldn't be reinterpreted for brand
+     reasons). */
+  --color-brand-blue: #4fc3e8;
+  --color-brand-magenta: #e8a0d8;
+
+  --color-status-healthy: #3ddc84;
+  --color-status-healthy-bg: #0d1f15;
+  --color-status-running: #4da8ff;
+  --color-status-running-bg: #0c1a2e;
+  --color-status-overdue: #f2a93b;
+  --color-status-overdue-bg: #241a0a;
+  --color-status-failed: #f2545b;
+  --color-status-failed-bg: #26100f;
+  --color-status-idle: #6b7684;
+  --color-status-idle-bg: #131313;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans);
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.brand-gradient-text {
+  background: linear-gradient(90deg, var(--color-brand-blue), var(--color-brand-magenta));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* The one deliberate motion in the whole interface: a radar-style pulse
+   ring on live "running" indicators -- informative (something is
+   genuinely happening right now), not decoration. */
+@keyframes radar-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(77, 168, 255, 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 10px rgba(77, 168, 255, 0);
+  }
+}
+
+.pulse-live {
+  animation: radar-pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-up {
+  animation: fade-up 0.4s ease-out both;
 }
