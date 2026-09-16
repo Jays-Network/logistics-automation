@@ -34,6 +34,11 @@ route-resolver-logic.md for the full audit):
        similar merge turns up for another client later.
     6. No match at step 2 or 3 -> skip the row and log it for review. Never
        guess/fuzzy-match past this point.
+    7. GSM and Gold Vale (2026-09-16) are now fully diverted BEFORE this
+       algorithm ever runs — see GSM_GOLDVALE_CONFIG below. Their old
+       per-route invoicing sheets (GSM-DRC-DBN, GOLDVALE-COMMUS-DBN, etc.)
+       were deleted the same day their new country sheets were created, so
+       this algorithm has nothing left to match against for them.
 
 The plain "Glencore" folder (main-tracking id 5600395335624580) is a
 genuinely different, actively-used operation with its own sheet structure
@@ -42,6 +47,7 @@ genuinely different, actively-used operation with its own sheet structure
 """
 
 import os
+import re
 import time
 import logging
 from typing import Any
@@ -167,6 +173,86 @@ KNOWN_ROUTE_OVERRIDES.update({
 KNOWN_ROUTE_OVERRIDES.update({
     " ".join(v.split()).casefold(): BRIDGE_SPD_DRC for v in (
         "Bridge-DRC-LOCAL",
+    )
+})
+
+GLENCORE_FIMPIMPA = 7949082489474948
+GLENCORE_KANSANSHI = 6824445303017348
+GLENCORE_KCM = 628035855536004
+GLENCORE_MIMBULA = 7277469863464836
+GLENCORE_MOPANI = 7105748481036164
+GLENCORE_RGT = 8964850844913540
+GLENCORE_ZANRONG = 4572997676650372
+GLENCORE_ZCCZ = 5130982647877508
+
+# Glencore International consolidation, 2026-09-16 (per Jay): the 17
+# per-destination route sheets are grouped down to 8 sheets by mine/
+# loading-point prefix (the ROUTE picklist itself is untouched -- staff
+# still pick the same 17 granular values, they just now converge on
+# fewer physical sheets). Audited live: only Fimpimpa-DAR had real data
+# (2 rows, recovered from Deleted Items and moved onto the new FIMPIMPA
+# sheet after an accidental early deletion of the old sheet, 2026-09-16).
+# Note: FIMPIMPA, RGT, and ZCCZ each only ever had one ROUTE value to
+# begin with, so those three overrides are effectively a rename (dropping
+# the destination suffix) rather than a true many-to-one merge -- kept in
+# this same mechanism for consistency, per Jay's "group by first suffix,
+# extra" instruction covering all of them uniformly.
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_FIMPIMPA for v in (
+        "Glencore international-Fimpimpa-DAR",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_KANSANSHI for v in (
+        "Glencore international-Kansanshi-Beira", "Glencore international-Kansanshi-GRB",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_KCM for v in (
+        "Glencore international-KCM-DBN", "Glencore international-KCM-GRB",
+        "Glencore international-KCM-JHB", "Glencore international-KCM-POLYTRA KIWE",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_MIMBULA for v in (
+        "Glencore international-Mimbula-Beira", "Glencore international-Mimbula-WVB",
+        "Glencore international-Mimbula-DAR",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_MOPANI for v in (
+        "Glencore international-Mopani-GRB", "Glencore international-Mopani-DBN",
+        "Glencore international-Mopani-JHB",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_RGT for v in (
+        "Glencore international-RGT-WVB",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_ZANRONG for v in (
+        "Glencore international-Zanrong-DAR", "Glencore international-Zanrong-WVB",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_ZCCZ for v in (
+        "Glencore international-ZCCZ-DAR",
+    )
+})
+
+SLS_AFRICA_NDOLA_PORT = 4990485677690756
+
+# SLS Africa NDOLA consolidation, 2026-09-16 (per Jay): NDOLA-DAR and
+# NDOLA-GRB both now converge onto one NDOLA-PORT sheet. Both old sheets
+# confirmed empty before deletion -- no data migration needed.
+# NDOLA-NAKONDE removed entirely (not replaced): no override needed since
+# it's no longer a selectable ROUTE option once Jay finishes removing it
+# from the picklist (the sheet-deletion half of this cleanup ran live;
+# the ROUTE-option removal is still pending on his end).
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): SLS_AFRICA_NDOLA_PORT for v in (
+        "SLS Africa-NDOLA-DAR", "SLS Africa-NDOLA-GRB",
     )
 })
 
@@ -330,6 +416,137 @@ def _process_bridge_multi_leg_row(conn, ss_client, main_sheet_id: int, row, colu
 
     return True
 
+
+# GSM/Gold Vale country-leg copy+move, 2026-09-16 (per Jay: "same logic
+# completely" as Bridge's multi-leg treatment, applied to both clients at
+# once). Deliberately simpler than Bridge's version -- NO ROUTE filtering:
+# every row on these two clients' main sheets goes through the same
+# DRC -> ZAM -> BOTS -> SA sequence, since (per Jay) "no conditions needed
+# for GSM and GoldVale". Both clients' old per-route invoicing sheets
+# (GSM-DRC-DBN, GSM-KAZ-DBN, GSM-MOKAMBO-DBN, GSM-GRB-DBN,
+# GOLDVALE-COMMUS-DBN, GOLDVALE-KAMOA MINE-DBN, GOLDVALE-LCS-DBN) were
+# deleted the same day these new country sheets were created -- so unlike
+# Bridge (where only 14 of many ROUTE values get this treatment and the
+# rest still flow through resolve_target_sheet_id() normally), GSM and
+# Gold Vale ROUTE values never reach resolve_target_sheet_id() at all
+# anymore; there's nothing left in their invoicing folders for it to
+# match against.
+#
+# SA is deliberately NOT one of the three country-leg approval columns
+# here (unlike DRC/ZAM/BOTS) -- per Jay, the existing final-delivery
+# approval columns (GSM's "Leron Wagner approval", Gold Vale's
+# "Siphemandla Hleza approval") stay exactly as they are, unrenamed, with
+# their own pre-existing Smartsheet automations gating them to Approved.
+# This function only WATCHES that final column to trigger the move; it
+# doesn't touch how the column gets set.
+GSM_GOLDVALE_CONFIG: dict[str, dict] = {
+    "gsm": {
+        "country_approval_columns": {
+            "DRC": ("DRC REGION: Approval", 455902156246916),      # GSM/DRC
+            "ZAM": ("ZAM REGION: Approval", 5241320357711748),     # GSM/ZAMBIA
+            "BOTS": ("BOTS REGION: Approval", 2707092084576132),   # GSM/BOTSWANA
+        },
+        "final_approval_column": "Leron Wagner approval",
+        "final_destination_sheet_id": 8760307322408836,            # GSM/SOUTH AFRICA
+    },
+    "goldvale": {
+        "country_approval_columns": {
+            "DRC": ("DRC REGION: Approval", 175320532733828),      # Gold Vale/DRC
+            "ZAM": ("ZAM REGION: Approval", 1998345171324804),     # Gold Vale/ZAMBIA
+            "BOTS": ("BOTS REGION: Approval", 7210691711946628),   # Gold Vale/BOTSWANA
+        },
+        "final_approval_column": "Siphemandla Hleza approval",
+        "final_destination_sheet_id": 4256303968112516,            # Gold Vale/SOUTH AFRICA
+    },
+}
+
+
+def _gsm_goldvale_country_already_copied(conn, source_sheet_id: int, source_row_id: int, country: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM gsm_goldvale_country_copy_log "
+            "WHERE source_sheet_id = %s AND source_row_id = %s AND country = %s AND status = 'copied'",
+            (source_sheet_id, source_row_id, country),
+        )
+        return cur.fetchone() is not None
+
+
+def _upsert_gsm_goldvale_country_copy_log(conn, client_slug, source_sheet_id, source_row_id, country,
+                                           target_sheet_id, target_row_id, status, error_message=None):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO gsm_goldvale_country_copy_log "
+            "(client_slug, source_sheet_id, source_row_id, country, target_sheet_id, target_row_id, status, error_message, copied_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp()) "
+            "ON CONFLICT (source_sheet_id, source_row_id, country) DO UPDATE SET "
+            "target_sheet_id = EXCLUDED.target_sheet_id, target_row_id = EXCLUDED.target_row_id, "
+            "status = EXCLUDED.status, error_message = EXCLUDED.error_message, "
+            "copied_at = EXCLUDED.copied_at",
+            (client_slug, source_sheet_id, source_row_id, country, target_sheet_id, target_row_id, status, error_message),
+        )
+    conn.commit()
+
+
+def _process_gsm_goldvale_country_leg_row(conn, ss_client, client_slug: str, main_sheet_id: int, row,
+                                           columns_by_id: dict, stats: dict) -> bool:
+    """
+    Handles GSM/Gold Vale's country-leg copy+move treatment. Returns True
+    if client_slug is one of the two configured in GSM_GOLDVALE_CONFIG
+    (handled here, regardless of whether anything actually fired this
+    call -- caller must NOT also run normal resolve_target_sheet_id() for
+    this row), False for every other client.
+    """
+    config = GSM_GOLDVALE_CONFIG.get(client_slug)
+    if config is None:
+        return False
+
+    cells_by_col = {cell.column_id: cell for cell in row.cells}
+    name_to_id = {title: col_id for col_id, title in columns_by_id.items()}
+
+    for country, (approval_col_name, target_sheet_id) in config["country_approval_columns"].items():
+        approval_col_id = name_to_id.get(approval_col_name)
+        if approval_col_id is None:
+            continue  # column not found -- e.g. not yet created on this sheet
+        cell = cells_by_col.get(approval_col_id)
+        value = (cell.display_value or cell.value) if cell else None
+        if not value or str(value).strip().casefold() != "approved":
+            continue
+        if _gsm_goldvale_country_already_copied(conn, main_sheet_id, row.id, country):
+            continue
+        try:
+            target_row_id = copy_row(ss_client, main_sheet_id, row.id, target_sheet_id)
+            _upsert_gsm_goldvale_country_copy_log(conn, client_slug, main_sheet_id, row.id, country,
+                                                   target_sheet_id, target_row_id, "copied")
+            stats["gsm_goldvale_country_copies"] = stats.get("gsm_goldvale_country_copies", 0) + 1
+            logger.info("%s country leg: copied row %s to %s sheet %s", client_slug, row.id, country, target_sheet_id)
+        except CopierError as exc:
+            _upsert_gsm_goldvale_country_copy_log(conn, client_slug, main_sheet_id, row.id, country,
+                                                   target_sheet_id, None, "error", str(exc))
+            logger.warning("%s country leg: copy to %s failed for row %s: %s", client_slug, country, row.id, exc)
+
+    final_col_id = name_to_id.get(config["final_approval_column"])
+    if final_col_id is not None:
+        cell = cells_by_col.get(final_col_id)
+        value = (cell.display_value or cell.value) if cell else None
+        if value and str(value).strip().casefold() == "approved":
+            route_col_id = name_to_id.get("ROUTE")
+            route_cell = cells_by_col.get(route_col_id) if route_col_id else None
+            route_value = (route_cell.display_value or route_cell.value) if route_cell else None
+            move_row(
+                conn, ss_client,
+                source_sheet_id=main_sheet_id,
+                source_row=row,
+                columns_by_id=columns_by_id,
+                target_sheet_id=config["final_destination_sheet_id"],
+                client_slug=client_slug,
+                route_value=str(route_value) if route_value else None,
+            )
+            stats["rows_moved"] = stats.get("rows_moved", 0) + 1
+            logger.info("%s: final delivery approved, row %s moved to SOUTH AFRICA sheet", client_slug, row.id)
+
+    return True
+
+
 # RELOAD's special case: when ROUTE == "Reload-DRC-LOCAL", the LOCAL ROUTE
 # column (not ROUTE) determines the real target — one of 4 sheets. Confirmed
 # live against the real LOCAL ROUTE picklist 2026-09-13 (29 options, matches
@@ -399,13 +616,43 @@ def _norm(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
+# Matches "<WORD> REGION: Approval" (case-insensitive, e.g. "DRC REGION:
+# Approval", "ZAM REGION: Approval", "BOTS REGION: Approval") -- the
+# per-leg approval columns now present on Bridge, GSM and Gold Vale's main
+# sheets. Excluded from _find_approval_column() below; see that function's
+# docstring for why.
+_REGION_APPROVAL_TITLE_RE = re.compile(r"^[a-z]+ region:\s*approval$")
+
+
 def _find_approval_column(columns_by_id: dict[int, str]) -> int | None:
     """Finds the "<Manager Name> approval" column by suffix match — the
     manager's name varies per client/sheet, only the " approval" suffix is
     stable. Confirmed with Jay 2026-09-13: the separate "Load approval
-    status" column must NOT be used, even though it looks similar."""
+    status" column must NOT be used, even though it looks similar.
+
+    FIXED 2026-09-16: also excludes the per-region "<COUNTRY> REGION:
+    Approval" columns now on Bridge, GSM and Gold Vale's main sheets.
+    Without this exclusion, whichever region-approval column happens to
+    sit at the lowest column index gets returned as THIS row's overall
+    gating approval column instead of the real final/manager approval
+    column. Confirmed this was silently wrong for Bridge specifically:
+    DRC REGION: Approval sits at column index 31 there, well before
+    Siphemandla Hleza delivery approval at index 116 -- so before this
+    fix, process_sheet()'s generic approval gate was checking DRC REGION:
+    Approval for every Bridge row, not the real final-delivery column.
+    GSM and Gold Vale happened to be unaffected by this specific symptom
+    only because their 3 new approval columns were appended at the END of
+    each sheet (after the pre-existing final approval column) -- but that
+    was luck of column order, not something to rely on, hence this fix
+    plus moving the per-client multi-leg/country-leg check to run BEFORE
+    this generic gate in process_sheet() (see that function)."""
     for col_id, title in columns_by_id.items():
-        if title.strip().casefold().endswith("approval") and title.strip().casefold() != "load approval status":
+        normalized = title.strip().casefold()
+        if normalized == "load approval status":
+            continue
+        if _REGION_APPROVAL_TITLE_RE.match(normalized):
+            continue
+        if normalized.endswith("approval"):
             return col_id
     return None
 
@@ -647,6 +894,19 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
     known_bad_targets_this_run: shared across all clients in one run --
     if a target sheet turns out to be full, every other row destined for
     it this run is skipped immediately instead of individually retried.
+
+    Per-client multi-leg/country-leg check (2026-09-16): Bridge's 14
+    multi-leg routes and GSM/Gold Vale's country-leg treatment each do
+    their OWN internal per-column approval gating (DRC/ZAM/BOTS/final
+    REGION: Approval columns, checked individually inside those
+    functions) -- so they run BEFORE the single generic approval_value
+    gate below, not after. The generic gate assumes one approval column
+    per sheet; these three clients now have several, so applying the
+    generic gate first would filter every row on whichever REGION:
+    Approval column _find_approval_column() happens to pick, silently
+    skipping rows that still need earlier-leg processing before that
+    column is ever set. See _find_approval_column()'s docstring for the
+    related fix this pairs with.
     """
     stats = {"rows_checked": 0, "rows_moved": 0, "rows_skipped_no_route": 0,
               "rows_skipped_not_approved": 0, "rows_failed_resolve": 0, "skipped_known_bad_target": 0}
@@ -690,6 +950,18 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
             continue
         route_value = str(route_value)
 
+        # Bridge multi-leg and GSM/Gold Vale country-leg handling both run
+        # BEFORE the generic approval gate -- see this function's
+        # docstring and _find_approval_column()'s docstring for why.
+        if client_slug == "bridge" and _process_bridge_multi_leg_row(
+            conn, ss_client, main_sheet_id, row, columns_by_id, route_value, stats
+        ):
+            continue
+        if _process_gsm_goldvale_country_leg_row(
+            conn, ss_client, client_slug, main_sheet_id, row, columns_by_id, stats
+        ):
+            continue
+
         approval_cell = cells_by_col.get(approval_col_id)
         approval_value = (approval_cell.display_value or approval_cell.value) if approval_cell else None
         if not approval_value or str(approval_value).strip().casefold() != "approved":
@@ -707,16 +979,6 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
             commodity_cell = cells_by_col.get(commodity_col_id)
             commodity_value = (commodity_cell.display_value or commodity_cell.value) if commodity_cell else None
             commodity_value = str(commodity_value) if commodity_value else None
-
-        # Bridge's 14 multi-leg routes, 2026-09-16 (per Jay): dual
-        # copy+move treatment, entirely separate from the normal
-        # single-target resolution below. Checked first -- if this was
-        # one of the 14, it's fully handled here (or correctly no-op'd
-        # if nothing's approved yet) and the row is done for this run.
-        if client_slug == "bridge" and _process_bridge_multi_leg_row(
-            conn, ss_client, main_sheet_id, row, columns_by_id, route_value, stats
-        ):
-            continue
 
         # Bridge Adhoc Tagging override, 2026-09-16 (per Jay): TAGGING
         # ONLY on ANY of Bridge's 9 region SERVICES REQUIRED columns
