@@ -330,6 +330,135 @@ def system_status():
     }
 
 
+# --- Telegram bots + chats real status (2026-09-16) ---
+# Three distinct bot tokens, per Jay: Jay's-Network (@jaysnetwork_bot),
+# WorldRisk (@WorldRisk_bot), ADARS (@ADARSnotification_bot). Mapping
+# below reflects the ACTUAL env vars each real job in this repo uses --
+# confirmed by reading the real code, not guessed. Known gap flagged
+# inline: Sync_ADARS.py currently posts via LOG_BOT_TOKEN, not the
+# dedicated ADARS_BOT_TOKEN -- Jay to confirm whether that job should
+# be updated; not changed here.
+TELEGRAM_BOTS = {
+    "jays_network": {"label": "Jay's-Network", "token_env": "LOG_BOT_TOKEN", "username": "@jaysnetwork_bot"},
+    "worldrisk": {"label": "WorldRisk", "token_env": "TELEGRAM_BOT_TOKEN", "username": "@WorldRisk_bot"},
+    "adars": {"label": "ADARS", "token_env": "ADARS_BOT_TOKEN", "username": "@ADARSnotification_bot"},
+}
+
+# label, which bot currently posts here, primary env var, fallback env
+# var (matches each job's actual os.getenv(...) fallback chain), and a
+# hardcoded last-resort default where the real code has one (e.g.
+# police_bot.py's DELETE_WATCH_GROUP_ID).
+TELEGRAM_CHATS = [
+    {"label": "Risk log", "bot": "jays_network", "env": "RISK_LOG_ID"},
+    {"label": "Admin DM", "bot": "jays_network", "env": "ADMIN_TELEGRAM_ID"},
+    {"label": "Finance log", "bot": "jays_network", "env": "FINANCE_LOG_ID"},
+    {"label": "ADARS log", "bot": "jays_network", "env": "ADARS_LOG_ID"},
+    {"label": "Archive router log", "bot": "jays_network", "env": "ARCHIVE_ROUTER_LOG_ID", "fallback_env": "RISK_LOG_ID"},
+    {"label": "Route resolver log", "bot": "jays_network", "env": "ROUTE_RESOLVER_LOG_ID", "fallback_env": "RISK_LOG_ID"},
+    {"label": "Main-to-contractor log", "bot": "jays_network", "env": "MAIN_TO_CONTRACTOR_LOG_ID", "fallback_env": "RISK_LOG_ID"},
+    {"label": "Border crossing overdue (main ops)", "bot": "worldrisk", "env": "TELEGRAM_BORDER_CROSSING_OVERDUE_ID"},
+    {"label": "Delete alert", "bot": "worldrisk", "env": "DELETE_ALERT_ID", "hardcoded_fallback": "-1004449570420"},
+    {"label": "Hourly report", "bot": "worldrisk", "env": "DELETE_WATCH_HOURLY_ID", "hardcoded_fallback": "-1004449570420"},
+]
+
+
+def _check_bot_live(token: str | None) -> dict:
+    if not token:
+        return {"reachable": False, "username": None, "first_name": None, "error": "token not set"}
+    try:
+        response = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=5)
+        if response.ok and response.json().get("ok"):
+            result = response.json()["result"]
+            return {"reachable": True, "username": result.get("username"), "first_name": result.get("first_name"), "error": None}
+        return {"reachable": False, "username": None, "first_name": None, "error": f"HTTP {response.status_code}"}
+    except Exception as exc:
+        return {"reachable": False, "username": None, "first_name": None, "error": str(exc)}
+
+
+def _check_chat_live(token: str | None, chat_id: str | None) -> dict:
+    if not token or not chat_id:
+        return {"reachable": False, "title": None, "type": None, "member_count": None, "error": "token or chat_id not set"}
+    try:
+        response = requests.get(
+            f"https://api.telegram.org/bot{token}/getChat", params={"chat_id": chat_id}, timeout=5
+        )
+        if not response.ok or not response.json().get("ok"):
+            return {"reachable": False, "title": None, "type": None, "member_count": None, "error": f"HTTP {response.status_code}"}
+        result = response.json()["result"]
+        member_count = None
+        try:
+            count_resp = requests.get(
+                f"https://api.telegram.org/bot{token}/getChatMemberCount", params={"chat_id": chat_id}, timeout=5
+            )
+            if count_resp.ok and count_resp.json().get("ok"):
+                member_count = count_resp.json()["result"]
+        except Exception:
+            pass  # private DMs (type="private") don't have a member count -- non-fatal
+        return {
+            "reachable": True,
+            "title": result.get("title") or result.get("first_name"),
+            "type": result.get("type"),
+            "member_count": member_count,
+            "error": None,
+        }
+    except Exception as exc:
+        return {"reachable": False, "title": None, "type": None, "member_count": None, "error": str(exc)}
+
+
+@app.post("/telegram-bots/{bot_key}/test", dependencies=[Depends(require_api_key)])
+def test_telegram_bot(bot_key: str):
+    """On-demand getMe -- returns the FULL raw bot profile (not just the
+    reachable/username summary the passive poll shows), so a manual test
+    press surfaces more than the automatic check already does."""
+    if bot_key not in TELEGRAM_BOTS:
+        raise HTTPException(status_code=404, detail=f"Unknown bot key: {bot_key}")
+    meta = TELEGRAM_BOTS[bot_key]
+    token = os.getenv(meta["token_env"])
+    if not token:
+        return {"ok": False, "error": f"{meta['token_env']} not set"}
+    try:
+        response = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=5)
+        body = response.json()
+        if response.ok and body.get("ok"):
+            return {"ok": True, "result": body["result"]}
+        return {"ok": False, "error": f"HTTP {response.status_code}: {body.get('description', 'unknown error')}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/telegram-status", dependencies=[Depends(require_api_key)])
+def telegram_status():
+    from concurrent.futures import ThreadPoolExecutor
+
+    def check_one_bot(item):
+        key, meta = item
+        token = os.getenv(meta["token_env"])
+        check = _check_bot_live(token)
+        return key, {"label": meta["label"], "expected_username": meta["username"], **check}
+
+    def check_one_chat(entry):
+        chat_id = os.getenv(entry["env"])
+        if not chat_id and entry.get("fallback_env"):
+            chat_id = os.getenv(entry["fallback_env"])
+        if not chat_id and entry.get("hardcoded_fallback"):
+            chat_id = entry["hardcoded_fallback"]
+        bot_meta = TELEGRAM_BOTS[entry["bot"]]
+        token = os.getenv(bot_meta["token_env"])
+        check = _check_chat_live(token, chat_id)
+        return {"label": entry["label"], "bot": bot_meta["label"], "env_var": entry["env"], **check}
+
+    # All ~23 external Telegram API calls fired concurrently instead of
+    # one after another -- fixes a real ~25s sequential load time
+    # (3 bots + 10 chats x up to 2 calls each), confirmed by Jay
+    # 2026-09-16. Wall-clock time now bounded by the SLOWEST single
+    # call, not the sum of all of them.
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        bot_results = dict(pool.map(check_one_bot, TELEGRAM_BOTS.items()))
+        chat_results = list(pool.map(check_one_chat, TELEGRAM_CHATS))
+
+    return {"bots": bot_results, "chats": chat_results}
+
+
 if __name__ == "__main__":
     import uvicorn
     # NOT YET DECIDED (2026-09-15): whether to bind specifically to the

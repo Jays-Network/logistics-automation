@@ -96,3 +96,28 @@ export interface SystemStatus {
   postgres: PostgresStats;
   grafana: GrafanaCheck;
 }
+
+export interface TelegramBotCheck {
+  label: string;
+  expected_username: string;
+  reachable: boolean;
+  username: string | null;
+  first_name: string | null;
+  error: string | null;
+}
+
+export interface TelegramChatCheck {
+  label: string;
+  bot: string;
+  env_var: string;
+  reachable: boolean;
+  title: string | null;
+  type: string | null;
+  member_count: number | null;
+  error: string | null;
+}
+
+export interface TelegramStatus {
+  bots: Record<string, TelegramBotCheck>;
+  chats: TelegramChatCheck[];
+}

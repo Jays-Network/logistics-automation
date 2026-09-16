@@ -4,6 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { LayoutGrid, MessageSquare, Radio, Smartphone, type LucideIcon } from "lucide-react";
+import { usePreloadTelegramStatus } from "@/lib/useTelegramStatus";
 
 interface NavItem {
   label: string;
@@ -18,13 +19,14 @@ interface NavItem {
 // somewhere that doesn't exist.
 const NAV_ITEMS: NavItem[] = [
   { label: "Jobs", href: "/", icon: LayoutGrid },
-  { label: "Telegram bots", href: null, icon: MessageSquare },
+  { label: "Telegram bots", href: "/telegram", icon: MessageSquare },
   { label: "WhatsApp scripts", href: null, icon: Smartphone },
   { label: "Forecasting", href: null, icon: Radio },
 ];
 
 export default function Sidebar() {
   const pathname = usePathname();
+  usePreloadTelegramStatus();
 
   return (
     <aside className="w-56 shrink-0 border-r border-hairline bg-panel flex flex-col">
