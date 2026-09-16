@@ -55,6 +55,7 @@ load_dotenv()
 
 from jobs.approval_router.backup import get_connection, row_to_dict
 from jobs.approval_router.mover import get_smartsheet_client, move_row, MoverError, get_move_log, SHEET_FULL_ERROR_CODE
+from jobs.approval_router.copier import copy_row, CopierError
 
 logger = logging.getLogger("approval_router.route_resolver")
 
@@ -87,7 +88,247 @@ MAIN_SHEETS: dict[str, dict[str, int]] = {
 # the normal prefix+sheet-name matching below with no override needed. Kept
 # as an empty dict (rather than removed) since it's a real mechanism other
 # clients may need in the future if a similar merge turns up.
+BRIDGE_KASUMBALESA = 870542728187780
+BRIDGE_IMPEX_NDOLA = 4144760446209924
+BRIDGE_BOTSWANA = 7242925575720836
+BRIDGE_SAKANIA = 1834488947756932
+BRIDGE_CCS_CHAMBISHI = 6613241359978372
+BRIDGE_KCM = 5315868239286148
+BRIDGE_LUANSHYA = 6851748007464836
+BRIDGE_CHIBOMBO_KAZUNGULA = 3654790577082244
+BRIDGE_SA = 2880608897552260
+BRIDGE_ADHOC_TAGGING = 5307589689823108
+BRIDGE_SABLE_NAKONDE = 427114064203652
+BRIDGE_SPD_DRC = 4189968332443524
+
+# Bridge consolidation, 2026-09-16 (per Jay): many ROUTE values now
+# converge on far fewer invoicing sheets. All simple many-to-one direct
+# overrides -- no secondary column needed, unlike RELOAD/IXM -- except
+# Adhoc Tagging, which is a separate pre-check (see
+# _bridge_adhoc_tagging_triggered below), and SPD-DRC, which simplifies
+# an entire long DRC REGION: LEG value list down to one ROUTE trigger
+# (Bridge-DRC-LOCAL) per Jay's explicit choice not to key off the leg.
+# Audited live 2026-09-16: only BRIDGE-IMPEX-KATIMA had real data (6
+# rows, migrated separately) -- every other old individual sheet these
+# replace was empty.
 KNOWN_ROUTE_OVERRIDES: dict[str, int] = {}
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_KASUMBALESA for v in (
+        "Bridge-KASUMBALESA -Chirundu", "Bridge-KASUMBALESA -KAZUNGULA",
+        "Bridge - KASUMBALESA - NAKONDE", "Bridge - KASUMBALESA - NDOLA",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_IMPEX_NDOLA for v in (
+        "Bridge-IMPEX-Katima", "Bridge - IMPEX - NAKONDE", "Bridge - IMPEX - SERENJE",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_BOTSWANA for v in (
+        "Bridge-KAZUNGULA -TLOKWENG", "Bridge-KAZUNGULA-GRB",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_SAKANIA for v in (
+        "Bridge-SAKANIA -Chirundu", "Bridge-SAKANIA -NDOLA", "Bridge - SAKANIA - NAKONDE",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_CCS_CHAMBISHI for v in (
+        "Bridge-CCS-serenje", "Bridge - CCS - KABWE", "Bridge - CCS - NAKONDE",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_KCM for v in (
+        "Bridge-KCM-ndola", "Bridge - KCM - NAKONDE",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_LUANSHYA for v in (
+        "Bridge-Luanshya-Ndola", "Bridge - LUANSHYA - KABWE",
+        "Bridge - LUANSHYA - NAKONDE", "Bridge - LUANSHYA - SERENJE",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_CHIBOMBO_KAZUNGULA for v in (
+        "Bridge - CHIBOMBO - KAZUNGULA",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_SA for v in (
+        "Bridge- WITBANK- DBN", "Bridge-SKILPAD- JHB",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_SABLE_NAKONDE for v in (
+        "Bridge - SABLE - NAKONDE",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): BRIDGE_SPD_DRC for v in (
+        "Bridge-DRC-LOCAL",
+    )
+})
+
+# Adhoc Tagging: NOT keyed on ROUTE at all -- per Jay, TAGGING ONLY on
+# ANY of the 9 region "...SERVICES REQUIRED" columns overrides normal
+# ROUTE-based resolution and sends the row here instead. Checked before
+# the normal resolve_target_sheet_id() call in process_client_rows.
+BRIDGE_SERVICES_REQUIRED_COLUMNS = [
+    "SOUTH AFRICA: SERVICES REQUIRED", "DRC: SERVICES REQUIRED",
+    "ZAMBIA: SERVICES REQUIRED", "ZIMBABWE: SERVICES REQUIRED",
+    "TAN: SERVICES REQUIRED", "NAM: SERVICES REQUIRED",
+    "BOTSWANA: SERVICES REQUIRED", "MOZ: SERVICES REQUIRED",
+    "MALAWI: SERVICES REQUIRED",
+]
+
+
+def _bridge_adhoc_tagging_triggered(cells_by_col: dict, columns_by_id: dict) -> bool:
+    """True if ANY of Bridge's 9 region SERVICES REQUIRED columns is
+    exactly 'TAGGING ONLY' on this row."""
+    name_to_id = {title: col_id for col_id, title in columns_by_id.items()}
+    for col_name in BRIDGE_SERVICES_REQUIRED_COLUMNS:
+        col_id = name_to_id.get(col_name)
+        if col_id is None:
+            continue
+        cell = cells_by_col.get(col_id)
+        value = (cell.display_value or cell.value) if cell else None
+        if value and str(value).strip().casefold() == "tagging only":
+            return True
+    return False
+
+
+# Bridge's 14 multi-leg routes, 2026-09-16 (per Jay): these pass
+# through multiple countries on the way to final delivery, needing a
+# COPY to each transited country's own sheet (checked via that
+# country's own REGION: Approval column) plus a final MOVE once fully
+# delivered (checked via the renamed "Siphemandla Hleza delivery
+# approval" column) -- a genuinely different treatment from every
+# other Bridge route, which gets a single direct override. Final
+# destination determined by the route's own suffix: -DBN -> South
+# Africa, -DAR -> Tanzania (Durban vs Dar es Salaam ports), confirmed
+# by Jay. Jay confirmed the correct scenario is sequential (one
+# country approved at a time) but built robust to more than one being
+# marked Approved at once, since human data-entry error is possible.
+#
+# "bridge-lcs-ddbn" is a legacy typo still sitting on ~9 real existing
+# rows, confirmed live 2026-09-16 -- the picklist option itself was
+# corrected to "Bridge-LCS-DBN", but Smartsheet doesn't retroactively
+# rewrite already-set cell values when a picklist option changes.
+# Kept as an alias here so those rows aren't silently orphaned.
+BRIDGE_MULTI_LEG_ROUTES: dict[str, str] = {
+    "bridge-tfm-dbn": "SA",
+    "bridge-sicomine mine-dbn": "SA",
+    "bridge-sicomine mine-dar": "TANZANIA",
+    "bridge-kfm -dar": "TANZANIA",
+    "bridge-zfm-dar": "TANZANIA",
+    "bridge-brother mine-dbn": "SA",
+    "bridge-mjm-dbn": "SA",
+    "bridge-tcc-dar": "TANZANIA",
+    "bridge-sable zinc-dbn": "SA",
+    "bridge-impex-dar": "TANZANIA",
+    "bridge-lcs-dbn": "SA",
+    "bridge-lcs-ddbn": "SA",  # legacy typo alias, see note above
+    "bridge-luilu-dar": "TANZANIA",
+    "bridge-chibombo-dbn": "SA",
+    "bridge - lcs - dar": "TANZANIA",
+}
+
+BRIDGE_FINAL_DESTINATION_SHEETS = {
+    "SA": BRIDGE_SA,
+    "TANZANIA": 8997865855864708,  # BRIDGE-TANZANIA, created 2026-09-16
+}
+
+# country -> (its own REGION: Approval column name, its own sheet_id)
+BRIDGE_COUNTRY_APPROVAL_COLUMNS = {
+    "DRC": ("DRC REGION: Approval", BRIDGE_SPD_DRC),
+    "ZAMBIA": ("ZAM REGION: Approval", 4259521972359044),  # BRIDGE-ZAMBIA, created 2026-09-16
+    "BOTSWANA": ("BOTS REGION: Approval", BRIDGE_BOTSWANA),
+}
+
+
+def _bridge_country_already_copied(conn, source_sheet_id: int, source_row_id: int, country: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM bridge_country_copy_log "
+            "WHERE source_sheet_id = %s AND source_row_id = %s AND country = %s AND status = 'copied'",
+            (source_sheet_id, source_row_id, country),
+        )
+        return cur.fetchone() is not None
+
+
+def _upsert_bridge_country_copy_log(conn, source_sheet_id, source_row_id, country,
+                                     target_sheet_id, target_row_id, status, error_message=None):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO bridge_country_copy_log "
+            "(source_sheet_id, source_row_id, country, target_sheet_id, target_row_id, status, error_message, copied_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, clock_timestamp()) "
+            "ON CONFLICT (source_sheet_id, source_row_id, country) DO UPDATE SET "
+            "target_sheet_id = EXCLUDED.target_sheet_id, target_row_id = EXCLUDED.target_row_id, "
+            "status = EXCLUDED.status, error_message = EXCLUDED.error_message, "
+            "copied_at = EXCLUDED.copied_at",
+            (source_sheet_id, source_row_id, country, target_sheet_id, target_row_id, status, error_message),
+        )
+    conn.commit()
+
+
+def _process_bridge_multi_leg_row(conn, ss_client, main_sheet_id: int, row, columns_by_id: dict,
+                                   route_value: str, stats: dict) -> bool:
+    """
+    Handles Bridge's 14 multi-leg routes' dual copy+move treatment.
+    Returns True if this route was one of the 14 (handled here,
+    regardless of whether anything actually fired this call -- caller
+    must NOT also run normal resolve_target_sheet_id() for this row),
+    False otherwise (not one of the 14, caller proceeds as normal).
+    """
+    normalized_route = _norm(route_value)
+    if normalized_route not in BRIDGE_MULTI_LEG_ROUTES:
+        return False
+
+    cells_by_col = {cell.column_id: cell for cell in row.cells}
+    name_to_id = {title: col_id for col_id, title in columns_by_id.items()}
+
+    for country, (approval_col_name, target_sheet_id) in BRIDGE_COUNTRY_APPROVAL_COLUMNS.items():
+        approval_col_id = name_to_id.get(approval_col_name)
+        if approval_col_id is None:
+            continue  # column not found -- e.g. not yet created on this sheet
+        cell = cells_by_col.get(approval_col_id)
+        value = (cell.display_value or cell.value) if cell else None
+        if not value or str(value).strip().casefold() != "approved":
+            continue
+        if _bridge_country_already_copied(conn, main_sheet_id, row.id, country):
+            continue
+        try:
+            target_row_id = copy_row(ss_client, main_sheet_id, row.id, target_sheet_id)
+            _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, target_row_id, "copied")
+            stats["bridge_country_copies"] = stats.get("bridge_country_copies", 0) + 1
+            logger.info("Bridge multi-leg: copied row %s to %s sheet %s", row.id, country, target_sheet_id)
+        except CopierError as exc:
+            _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, None, "error", str(exc))
+            logger.warning("Bridge multi-leg: copy to %s failed for row %s: %s", country, row.id, exc)
+
+    delivery_col_id = name_to_id.get("Siphemandla Hleza delivery approval")
+    if delivery_col_id is not None:
+        cell = cells_by_col.get(delivery_col_id)
+        value = (cell.display_value or cell.value) if cell else None
+        if value and str(value).strip().casefold() == "approved":
+            destination = BRIDGE_MULTI_LEG_ROUTES[normalized_route]
+            target_sheet_id = BRIDGE_FINAL_DESTINATION_SHEETS[destination]
+            move_row(
+                conn, ss_client,
+                source_sheet_id=main_sheet_id,
+                source_row=row,
+                columns_by_id=columns_by_id,
+                target_sheet_id=target_sheet_id,
+                client_slug="bridge",
+                route_value=route_value,
+            )
+            stats["rows_moved"] = stats.get("rows_moved", 0) + 1
+            logger.info("Bridge multi-leg: final delivery approved, row %s moved to %s (%s)",
+                        row.id, destination, target_sheet_id)
+
+    return True
 
 # RELOAD's special case: when ROUTE == "Reload-DRC-LOCAL", the LOCAL ROUTE
 # column (not ROUTE) determines the real target — one of 4 sheets. Confirmed
@@ -98,7 +339,13 @@ RELOAD_TRIGGER_ROUTE = "reload-drc-local"
 RELOAD_KOLWEZI = 907292680605572
 RELOAD_LIKASI = 3831881941340036
 RELOAD_FUNGURUME = 4887378744266628
-RELOAD_KASUMBALESA = 869874388651908
+# Sheet renamed "Kasumbalesa" -> "Lubumbashi" by Jay, 2026-09-16 (manual
+# Smartsheet UI change -- no API for renames). Same sheet_id, routing is
+# ID-based so this needed no other code change. The "KAS" suffix in the
+# LOCAL ROUTE picklist values below is unrelated -- that's the
+# Kasumbalesa border-crossing abbreviation on the main-tracking side,
+# confirmed staying as-is.
+RELOAD_LUBUMBASHI = 869874388651908
 
 RELOAD_LOCAL_ROUTE_MAP: dict[str, int] = {
     normalized: RELOAD_KOLWEZI for normalized in (
@@ -123,10 +370,25 @@ RELOAD_LOCAL_ROUTE_MAP.update({
     )
 })
 RELOAD_LOCAL_ROUTE_MAP.update({
-    normalized: RELOAD_KASUMBALESA for normalized in (
+    normalized: RELOAD_LUBUMBASHI for normalized in (
         "reload-sem - kas", "reload-kicc - kas",
     )
 })
+
+# IXM's commodity split, 2026-09-16 (per Jay): ROUTE stays "IXM-Lonshi-Dar"
+# unchanged -- the new COMMODITY column (PICKLIST, confirmed live: exactly
+# "COPPER CATHODES" / "COPPER CONCENTRATE", no other options) picks which
+# of two new sheets the row goes to instead of the old single sheet, which
+# is being retired. Both new sheets created from the old sheet as template
+# (same mechanism as every other sheet in this project) -- confirmed
+# structurally identical, including the COMMODITY/ROUTE/approval columns.
+IXM_TRIGGER_ROUTE = "ixm-lonshi-dar"
+IXM_COPPER_CATHODES = 5937869698060164
+IXM_COPPER_CONCENTRATE = 6012143507033988
+IXM_COMMODITY_MAP: dict[str, int] = {
+    "copper cathodes": IXM_COPPER_CATHODES,
+    "copper concentrate": IXM_COPPER_CONCENTRATE,
+}
 
 
 def _norm(value: str) -> str:
@@ -178,10 +440,11 @@ def resolve_target_sheet_id(
     route_value: str,
     local_route_value: str | None,
     folder_cache: "_FolderSheetCache",
+    commodity_value: str | None = None,
 ) -> tuple[int | None, str]:
     """
-    Resolves a ROUTE value (plus, for RELOAD, the LOCAL ROUTE value) to a
-    target invoicing sheet_id.
+    Resolves a ROUTE value (plus, for RELOAD, the LOCAL ROUTE value; for
+    IXM, the COMMODITY value) to a target invoicing sheet_id.
 
     Returns (sheet_id_or_None, reason) — reason is a short human-readable
     string explaining the outcome, useful for logging when sheet_id is None.
@@ -199,6 +462,15 @@ def resolve_target_sheet_id(
         if sheet_id is None:
             return None, f"RELOAD LOCAL ROUTE value not in known map: {local_route_value!r}"
         return sheet_id, "RELOAD local route map"
+
+    if normalized_route == IXM_TRIGGER_ROUTE:
+        if not commodity_value or not commodity_value.strip():
+            return None, "IXM-Lonshi-Dar but COMMODITY column is blank"
+        normalized_commodity = _norm(commodity_value)
+        sheet_id = IXM_COMMODITY_MAP.get(normalized_commodity)
+        if sheet_id is None:
+            return None, f"IXM COMMODITY value not in known map: {commodity_value!r}"
+        return sheet_id, "IXM commodity map"
 
     prefix = route_value.split("-", 1)[0].strip()
     if not prefix:
@@ -393,6 +665,7 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
 
     route_col_id = _find_column_id(columns_by_id, "ROUTE") or _find_column_id(columns_by_id, "Routes")
     local_route_col_id = _find_column_id(columns_by_id, "LOCAL ROUTE")
+    commodity_col_id = _find_column_id(columns_by_id, "COMMODITY")
     approval_col_id = _find_approval_column(columns_by_id)
 
     if route_col_id is None:
@@ -429,12 +702,36 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
             local_route_value = (local_cell.display_value or local_cell.value) if local_cell else None
             local_route_value = str(local_route_value) if local_route_value else None
 
-        target_sheet_id, reason = resolve_target_sheet_id(route_value, local_route_value, folder_cache)
+        commodity_value = None
+        if commodity_col_id is not None:
+            commodity_cell = cells_by_col.get(commodity_col_id)
+            commodity_value = (commodity_cell.display_value or commodity_cell.value) if commodity_cell else None
+            commodity_value = str(commodity_value) if commodity_value else None
+
+        # Bridge's 14 multi-leg routes, 2026-09-16 (per Jay): dual
+        # copy+move treatment, entirely separate from the normal
+        # single-target resolution below. Checked first -- if this was
+        # one of the 14, it's fully handled here (or correctly no-op'd
+        # if nothing's approved yet) and the row is done for this run.
+        if client_slug == "bridge" and _process_bridge_multi_leg_row(
+            conn, ss_client, main_sheet_id, row, columns_by_id, route_value, stats
+        ):
+            continue
+
+        # Bridge Adhoc Tagging override, 2026-09-16 (per Jay): TAGGING
+        # ONLY on ANY of Bridge's 9 region SERVICES REQUIRED columns
+        # redirects here regardless of what ROUTE says -- checked before
+        # normal resolution, not part of resolve_target_sheet_id's
+        # ROUTE-keyed logic.
+        if client_slug == "bridge" and _bridge_adhoc_tagging_triggered(cells_by_col, columns_by_id):
+            target_sheet_id, reason = BRIDGE_ADHOC_TAGGING, "Bridge Adhoc Tagging override"
+        else:
+            target_sheet_id, reason = resolve_target_sheet_id(route_value, local_route_value, folder_cache, commodity_value)
         if target_sheet_id is None:
             stats["rows_failed_resolve"] += 1
             logger.warning(
-                "Could not resolve target for row %s on %s (ROUTE=%r, LOCAL ROUTE=%r): %s",
-                row.id, client_slug, route_value, local_route_value, reason,
+                "Could not resolve target for row %s on %s (ROUTE=%r, LOCAL ROUTE=%r, COMMODITY=%r): %s",
+                row.id, client_slug, route_value, local_route_value, commodity_value, reason,
             )
             _alert_unresolvable_route(conn, client_slug, route_value, local_route_value, reason)
             _upsert_unresolved(conn, main_sheet_id, row.id, client_slug, route_value, reason)
