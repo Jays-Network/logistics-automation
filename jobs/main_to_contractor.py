@@ -61,16 +61,63 @@ logger = logging.getLogger("main_to_contractor")
 # every contractor sheet currently maps to exactly one region; the
 # contractor company name itself is NOT used for matching (confirmed
 # with Jay: it's arbitrary internal naming, not a routing key).
-REGION_TO_CONTRACTOR_SHEET: dict[str, int] = {
-    "MOZ": 7071129797611396,   # A-Track Mozambique
-    "BOTS": 4096231923994500,  # ADARS Botswana
-    "SA": 8244727318007684,    # ADARS SA
-    "DRC": 1413715040620420,   # SPD DRC
-    "TAN": 992501116653444,    # SPS Tanzania
-    "ZAM": 2879447154773892,   # SPS Zambia
-    "NAM": 3887174390861700,   # WR Namibia
-    "ZIM": 4599803954548612,   # Zimbabwe
-}
+class _RegionSheetMap:
+    """region_code -> ACTIVE contractor sheet id.
+
+    Read from contractor_sheet_state (migration 018) once per process, i.e.
+    once per cron run. contractors_router.py updates that table when it
+    rotates a sheet, so both jobs always agree on which sheet is live.
+    FAILS CLOSED: an empty table raises rather than guessing IDs, because a
+    wrong guess means copying rows into an archived sheet (the 2026-09-29
+    incident). Unmapped regions (e.g. MAL) still return None from .get().
+    """
+
+    def __init__(self):
+        self._map = None
+
+    def _ensure_loaded(self):
+        if self._map is None:
+            conn = get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT region_code, active_sheet_id FROM contractor_sheet_state")
+                    rows = cur.fetchall()
+            finally:
+                conn.close()
+            if not rows:
+                raise RuntimeError(
+                    "contractor_sheet_state is empty -- apply migration 018 first; "
+                    "refusing to guess contractor sheet IDs"
+                )
+            self._map = {str(code).strip().upper(): int(sheet_id) for code, sheet_id in rows}
+        return self._map
+
+    def get(self, region_code, default=None):
+        return self._ensure_loaded().get(region_code, default)
+
+    def __getitem__(self, region_code):
+        return self._ensure_loaded()[region_code]
+
+    def __contains__(self, region_code):
+        return region_code in self._ensure_loaded()
+
+    def items(self):
+        return self._ensure_loaded().items()
+
+    def keys(self):
+        return self._ensure_loaded().keys()
+
+    def values(self):
+        return self._ensure_loaded().values()
+
+    def __iter__(self):
+        return iter(self._ensure_loaded())
+
+    def __len__(self):
+        return len(self._ensure_loaded())
+
+
+REGION_TO_CONTRACTOR_SHEET = _RegionSheetMap()
 # MAL (Malawi) has a SUBMIT checkbox on main sheets but no contractor
 # sheet yet -- deliberately absent so it's caught by the "unmapped
 # region" path below instead of silently matched.
