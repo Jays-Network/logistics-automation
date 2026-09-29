@@ -38,7 +38,9 @@ route-resolver-logic.md for the full audit):
        algorithm ever runs — see GSM_GOLDVALE_CONFIG below. Their old
        per-route invoicing sheets (GSM-DRC-DBN, GOLDVALE-COMMUS-DBN, etc.)
        were deleted the same day their new country sheets were created, so
-       this algorithm has nothing left to match against for them.
+       this algorithm has nothing left to match against for them. Bridge
+       (2026-09-23) joined this same "fully diverted before ROUTE matching"
+       group — see _process_bridge_country_leg_row below.
 
 The plain "Glencore" folder (main-tracking id 5600395335624580) is a
 genuinely different, actively-used operation with its own sheet structure
@@ -85,27 +87,25 @@ MAIN_SHEETS: dict[str, dict[str, int]] = {
     "zalawi":                 {"main_sheet_id": 3698247053823876, "invoicing_folder_id": 6490485884774276},
 }
 
-# Confirmed 2026-09-13: Bridge's ROUTE picklist previously had two options
-# ("Sicomine Mine-DBN" and "Sicomine Mine-DAR") pointing at one combined
-# sheet. Jay asked for these split into two separate sheets instead of
-# staying merged — done live (new sheets BRIDGE-SICOMINE MINE-DBN /
-# BRIDGE-SICOMINE MINE-DAR, both empty, created from the same template as
-# the other Bridge sheets). Both ROUTE values now resolve correctly through
-# the normal prefix+sheet-name matching below with no override needed. Kept
-# as an empty dict (rather than removed) since it's a real mechanism other
-# clients may need in the future if a similar merge turns up.
-BRIDGE_KASUMBALESA = 870542728187780
-BRIDGE_IMPEX_NDOLA = 4144760446209924
 BRIDGE_BOTSWANA = 7242925575720836
-BRIDGE_SAKANIA = 1834488947756932
-BRIDGE_CCS_CHAMBISHI = 6613241359978372
-BRIDGE_KCM = 5315868239286148
-BRIDGE_LUANSHYA = 6851748007464836
-BRIDGE_CHIBOMBO_KAZUNGULA = 3654790577082244
 BRIDGE_SA = 2880608897552260
 BRIDGE_ADHOC_TAGGING = 5307589689823108
-BRIDGE_SABLE_NAKONDE = 427114064203652
 BRIDGE_SPD_DRC = 4189968332443524
+# Country-sheet rebuild, 2026-09-23 (per Jay: "convert it to all routes"):
+# no more ROUTE-keyed consolidation sheets for Bridge -- the 12 old ones
+# (formerly BRIDGE_KASUMBALESA, BRIDGE_IMPEX_NDOLA, BRIDGE_SAKANIA,
+# BRIDGE_CCS_CHAMBISHI, BRIDGE_KCM, BRIDGE_LUANSHYA,
+# BRIDGE_CHIBOMBO_KAZUNGULA, BRIDGE_SABLE_NAKONDE, plus 4 more with no
+# real data) were retired live the same day this shipped -- 2 had real
+# rows (IMPEX NDOLA 14, LUANSHYA 8), both confirmed Zambia by Jay and
+# migrated into BRIDGE_ZAMBIA before deletion. Replaced by 8
+# country-level sheets: 4 copy-stage (DRC/ZAM/ZIM/BOTS, below) and 4
+# final-destination (TAN/NAM/SA/MOZ, below).
+BRIDGE_ZAMBIA = 4259521972359044
+BRIDGE_TANZANIA = 8997865855864708
+BRIDGE_NAMIBIA = 2580636771766148
+BRIDGE_ZIMBABWE = 1669528179396484
+BRIDGE_MOZAMBIQUE = 6173127806766980
 
 # Bridge consolidation, 2026-09-16 (per Jay): many ROUTE values now
 # converge on far fewer invoicing sheets. All simple many-to-one direct
@@ -118,63 +118,12 @@ BRIDGE_SPD_DRC = 4189968332443524
 # rows, migrated separately) -- every other old individual sheet these
 # replace was empty.
 KNOWN_ROUTE_OVERRIDES: dict[str, int] = {}
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_KASUMBALESA for v in (
-        "Bridge-KASUMBALESA -Chirundu", "Bridge-KASUMBALESA -KAZUNGULA",
-        "Bridge - KASUMBALESA - NAKONDE", "Bridge - KASUMBALESA - NDOLA",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_IMPEX_NDOLA for v in (
-        "Bridge-IMPEX-Katima", "Bridge - IMPEX - NAKONDE", "Bridge - IMPEX - SERENJE",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_BOTSWANA for v in (
-        "Bridge-KAZUNGULA -TLOKWENG", "Bridge-KAZUNGULA-GRB",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_SAKANIA for v in (
-        "Bridge-SAKANIA -Chirundu", "Bridge-SAKANIA -NDOLA", "Bridge - SAKANIA - NAKONDE",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_CCS_CHAMBISHI for v in (
-        "Bridge-CCS-serenje", "Bridge - CCS - KABWE", "Bridge - CCS - NAKONDE",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_KCM for v in (
-        "Bridge-KCM-ndola", "Bridge - KCM - NAKONDE",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_LUANSHYA for v in (
-        "Bridge-Luanshya-Ndola", "Bridge - LUANSHYA - KABWE",
-        "Bridge - LUANSHYA - NAKONDE", "Bridge - LUANSHYA - SERENJE",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_CHIBOMBO_KAZUNGULA for v in (
-        "Bridge - CHIBOMBO - KAZUNGULA",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_SA for v in (
-        "Bridge- WITBANK- DBN", "Bridge-SKILPAD- JHB",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_SABLE_NAKONDE for v in (
-        "Bridge - SABLE - NAKONDE",
-    )
-})
-KNOWN_ROUTE_OVERRIDES.update({
-    " ".join(v.split()).casefold(): BRIDGE_SPD_DRC for v in (
-        "Bridge-DRC-LOCAL",
-    )
-})
+# Bridge no longer contributes any entries here (2026-09-23 rebuild) --
+# every Bridge row is diverted to _process_bridge_country_leg_row()
+# before resolve_target_sheet_id() is ever called, same as GSM/Gold Vale.
+# See BRIDGE_COUNTRY_APPROVAL_COLUMNS / BRIDGE_FINAL_DESTINATION_DATE_COLUMNS
+# below. Glencore International and SLS Africa's overrides (further down)
+# still use this same dict.
 
 GLENCORE_FIMPIMPA = 7949082489474948
 GLENCORE_KANSANSHI = 6824445303017348
@@ -184,6 +133,7 @@ GLENCORE_MOPANI = 7105748481036164
 GLENCORE_RGT = 8964850844913540
 GLENCORE_ZANRONG = 4572997676650372
 GLENCORE_ZCCZ = 5130982647877508
+GLENCORE_CCM = 4440228627697540
 
 # Glencore International consolidation, 2026-09-16 (per Jay): the 17
 # per-destination route sheets are grouped down to 8 sheets by mine/
@@ -197,6 +147,9 @@ GLENCORE_ZCCZ = 5130982647877508
 # the destination suffix) rather than a true many-to-one merge -- kept in
 # this same mechanism for consistency, per Jay's "group by first suffix,
 # extra" instruction covering all of them uniformly.
+# 2026-09-29 (per Jay): two more routes added -- "Mopani-Harare" joins the
+# existing MOPANI group, and "CCM-Beira" starts a 9th group (CCM) with its
+# own new sheet, GLENCORE INTERNATIONAL-CCM (GLENCORE_CCM above).
 KNOWN_ROUTE_OVERRIDES.update({
     " ".join(v.split()).casefold(): GLENCORE_FIMPIMPA for v in (
         "Glencore international-Fimpimpa-DAR",
@@ -222,7 +175,7 @@ KNOWN_ROUTE_OVERRIDES.update({
 KNOWN_ROUTE_OVERRIDES.update({
     " ".join(v.split()).casefold(): GLENCORE_MOPANI for v in (
         "Glencore international-Mopani-GRB", "Glencore international-Mopani-DBN",
-        "Glencore international-Mopani-JHB",
+        "Glencore international-Mopani-JHB", "Glencore international-Mopani-Harare",
     )
 })
 KNOWN_ROUTE_OVERRIDES.update({
@@ -238,6 +191,11 @@ KNOWN_ROUTE_OVERRIDES.update({
 KNOWN_ROUTE_OVERRIDES.update({
     " ".join(v.split()).casefold(): GLENCORE_ZCCZ for v in (
         "Glencore international-ZCCZ-DAR",
+    )
+})
+KNOWN_ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_CCM for v in (
+        "Glencore international-CCM-Beira",
     )
 })
 
@@ -284,52 +242,44 @@ def _bridge_adhoc_tagging_triggered(cells_by_col: dict, columns_by_id: dict) -> 
     return False
 
 
-# Bridge's 14 multi-leg routes, 2026-09-16 (per Jay): these pass
-# through multiple countries on the way to final delivery, needing a
-# COPY to each transited country's own sheet (checked via that
-# country's own REGION: Approval column) plus a final MOVE once fully
-# delivered (checked via the renamed "Siphemandla Hleza delivery
-# approval" column) -- a genuinely different treatment from every
-# other Bridge route, which gets a single direct override. Final
-# destination determined by the route's own suffix: -DBN -> South
-# Africa, -DAR -> Tanzania (Durban vs Dar es Salaam ports), confirmed
-# by Jay. Jay confirmed the correct scenario is sequential (one
-# country approved at a time) but built robust to more than one being
-# marked Approved at once, since human data-entry error is possible.
+# Bridge country-sheet rebuild, 2026-09-23 (per Jay: "convert it to all
+# routes" -- no ROUTE filtering at all anymore, same no-conditions
+# approach GSM/Gold Vale already use). Every Bridge row goes through the
+# same 4 independent copy-stage checks regardless of ROUTE, plus one
+# final-delivery gate that now resolves to one of 4 destinations instead
+# of 2 -- see _process_bridge_country_leg_row() below.
 #
-# "bridge-lcs-ddbn" is a legacy typo still sitting on ~9 real existing
-# rows, confirmed live 2026-09-16 -- the picklist option itself was
-# corrected to "Bridge-LCS-DBN", but Smartsheet doesn't retroactively
-# rewrite already-set cell values when a picklist option changes.
-# Kept as an alias here so those rows aren't silently orphaned.
-BRIDGE_MULTI_LEG_ROUTES: dict[str, str] = {
-    "bridge-tfm-dbn": "SA",
-    "bridge-sicomine mine-dbn": "SA",
-    "bridge-sicomine mine-dar": "TANZANIA",
-    "bridge-kfm -dar": "TANZANIA",
-    "bridge-zfm-dar": "TANZANIA",
-    "bridge-brother mine-dbn": "SA",
-    "bridge-mjm-dbn": "SA",
-    "bridge-tcc-dar": "TANZANIA",
-    "bridge-sable zinc-dbn": "SA",
-    "bridge-impex-dar": "TANZANIA",
-    "bridge-lcs-dbn": "SA",
-    "bridge-lcs-ddbn": "SA",  # legacy typo alias, see note above
-    "bridge-luilu-dar": "TANZANIA",
-    "bridge-chibombo-dbn": "SA",
-    "bridge - lcs - dar": "TANZANIA",
-}
-
-BRIDGE_FINAL_DESTINATION_SHEETS = {
-    "SA": BRIDGE_SA,
-    "TANZANIA": 8997865855864708,  # BRIDGE-TANZANIA, created 2026-09-16
-}
-
+# Four copy-stage countries: DRC, ZAM, ZIM, BOTS. Each has its own
+# REGION: Approval column -- ZIM's was added live 2026-09-23 (previously
+# missing; DRC/ZAM/BOTS already existed from the 2026-09-16 build).
 # country -> (its own REGION: Approval column name, its own sheet_id)
+# NOTE: these keys are written directly into bridge_country_copy_log.country,
+# which has a CHECK constraint (migration 016, extended by migration 018)
+# restricted to the FULL country names -- 'DRC', 'ZAMBIA', 'ZIMBABWE',
+# 'BOTSWANA'. Do not shorten these to 'ZAM'/'ZIM'/'BOTS' (that abbreviated
+# style is fine on gsm_goldvale_country_copy_log, which has no CHECK
+# constraint at all, but would violate this one).
 BRIDGE_COUNTRY_APPROVAL_COLUMNS = {
     "DRC": ("DRC REGION: Approval", BRIDGE_SPD_DRC),
-    "ZAMBIA": ("ZAM REGION: Approval", 4259521972359044),  # BRIDGE-ZAMBIA, created 2026-09-16
+    "ZAMBIA": ("ZAM REGION: Approval", BRIDGE_ZAMBIA),
+    "ZIMBABWE": ("ZIM REGION: Approval", BRIDGE_ZIMBABWE),
     "BOTSWANA": ("BOTS REGION: Approval", BRIDGE_BOTSWANA),
+}
+
+# Final destination -- 4 possible sheets now (TAN/NAM/SA/MOZ), still
+# gated by the single "Siphemandla Hleza delivery approval" column.
+# Which of the 4 a row moves to is decided by checking which country's
+# own REGION: ARRIVAL DATE is filled in -- confirmed by Jay 2026-09-23:
+# "if sa has a date and other 3 are blank it moves to sa". Exactly one
+# must be filled; zero or more than one is ambiguous and the row is
+# skipped + flagged rather than guessed (see the fail-safe in
+# _process_bridge_country_leg_row below).
+# country -> (its own REGION: ARRIVAL DATE column name, its own sheet_id)
+BRIDGE_FINAL_DESTINATION_DATE_COLUMNS = {
+    "TAN": ("TAN REGION: ARRIVAL DATE", BRIDGE_TANZANIA),
+    "NAM": ("NAM REGION: ARRIVAL DATE", BRIDGE_NAMIBIA),
+    "SA": ("SA REGION: ARRIVAL DATE", BRIDGE_SA),
+    "MOZ": ("MOZ REGION: ARRIVAL DATE", BRIDGE_MOZAMBIQUE),
 }
 
 
@@ -359,19 +309,76 @@ def _upsert_bridge_country_copy_log(conn, source_sheet_id, source_row_id, countr
     conn.commit()
 
 
-def _process_bridge_multi_leg_row(conn, ss_client, main_sheet_id: int, row, columns_by_id: dict,
-                                   route_value: str, stats: dict) -> bool:
+def _alert_bridge_final_destination_ambiguous(conn, row_id: int, filled_countries: list):
     """
-    Handles Bridge's 14 multi-leg routes' dual copy+move treatment.
-    Returns True if this route was one of the 14 (handled here,
-    regardless of whether anything actually fired this call -- caller
-    must NOT also run normal resolve_target_sheet_id() for this row),
-    False otherwise (not one of the 14, caller proceeds as normal).
+    Alerts once per row per 24h if Bridge's final delivery approval fires
+    but the TAN/NAM/SA/MOZ arrival-date check can't determine a single
+    destination (zero or more than one filled) -- same de-dupe
+    philosophy as _alert_unresolvable_route() below: never re-alert every
+    10-minute cron tick for the same unresolved row.
     """
-    normalized_route = _norm(route_value)
-    if normalized_route not in BRIDGE_MULTI_LEG_ROUTES:
-        return False
+    dedupe_key = f"bridge-final-dest-ambiguous|{row_id}"
 
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM automation_telegram_alert_log "
+            "WHERE job_name = %s AND message LIKE %s AND sent_at > now() - interval '24 hours' LIMIT 1",
+            (JOB_NAME, f"%{dedupe_key}%"),
+        )
+        if cur.fetchone():
+            return
+
+    message = (
+        f"\u26a0\ufe0f *route_resolver*: Bridge final delivery approved but final "
+        f"destination is ambiguous on row `{row_id}`\n"
+        f"TAN/NAM/SA/MOZ arrival dates filled: {filled_countries or 'none'}\n"
+        f"Exactly one must be filled to resolve a destination.\n"
+        f"`{dedupe_key}`"
+    )
+    delivered, delivery_error = _send_telegram(message)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO automation_telegram_alert_log "
+            "(severity, job_name, chat_id, message, delivered, delivery_error) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            ("warning", JOB_NAME, os.getenv("ROUTE_RESOLVER_LOG_ID") or os.getenv("RISK_LOG_ID") or "",
+             message, delivered, delivery_error),
+        )
+    conn.commit()
+
+
+def _process_bridge_country_leg_row(conn, ss_client, main_sheet_id: int, row, columns_by_id: dict,
+                                     stats: dict) -> bool:
+    """
+    Bridge's country-sheet treatment, rebuilt 2026-09-23 (per Jay:
+    "convert it to all routes"). Always returns True -- caller must NOT
+    also run normal resolve_target_sheet_id() for Bridge rows anymore;
+    there's nothing left in BRIDGE's invoicing folder for the old
+    ROUTE-matching algorithm to match against (the 12 old consolidated
+    sheets were retired the same day this shipped).
+
+    Four copy-stage countries (DRC, ZAM, ZIM, BOTS): flipping that
+    country's own REGION: Approval column to Approved copies the row to
+    that country's sheet (row stays on the main sheet) -- same
+    dedup-via-log mechanism as the original 2026-09-16 build, now with
+    ZIM added as a fourth leg.
+
+    Final destination (TAN, NAM, SA, MOZ): gated by the single
+    "Siphemandla Hleza delivery approval" column. Which of the 4 a row
+    moves to is decided by checking which country's own REGION: ARRIVAL
+    DATE is filled in (per Jay: "if sa has a date and other 3 are blank
+    it moves to sa"). Fail-safe: zero or more than one filled is treated
+    as ambiguous -- the row is skipped and flagged for review rather
+    than guessed, same "never guess" philosophy as
+    resolve_target_sheet_id() elsewhere in this module.
+
+    Adhoc Tagging stays exactly as it was (per Jay: "leave the adhoc
+    sheet and route") -- TAGGING ONLY on any of Bridge's 9 region
+    SERVICES REQUIRED columns still overrides the date-based
+    final-destination check and sends the row to BRIDGE_ADHOC_TAGGING
+    instead, gated by the same final approval column.
+    """
     cells_by_col = {cell.column_id: cell for cell in row.cells}
     name_to_id = {title: col_id for col_id, title in columns_by_id.items()}
 
@@ -389,31 +396,63 @@ def _process_bridge_multi_leg_row(conn, ss_client, main_sheet_id: int, row, colu
             target_row_id = copy_row(ss_client, main_sheet_id, row.id, target_sheet_id)
             _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, target_row_id, "copied")
             stats["bridge_country_copies"] = stats.get("bridge_country_copies", 0) + 1
-            logger.info("Bridge multi-leg: copied row %s to %s sheet %s", row.id, country, target_sheet_id)
+            logger.info("Bridge: copied row %s to %s sheet %s", row.id, country, target_sheet_id)
         except CopierError as exc:
             _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, None, "error", str(exc))
-            logger.warning("Bridge multi-leg: copy to %s failed for row %s: %s", country, row.id, exc)
+            logger.warning("Bridge: copy to %s failed for row %s: %s", country, row.id, exc)
 
     delivery_col_id = name_to_id.get("Siphemandla Hleza delivery approval")
-    if delivery_col_id is not None:
-        cell = cells_by_col.get(delivery_col_id)
-        value = (cell.display_value or cell.value) if cell else None
-        if value and str(value).strip().casefold() == "approved":
-            destination = BRIDGE_MULTI_LEG_ROUTES[normalized_route]
-            target_sheet_id = BRIDGE_FINAL_DESTINATION_SHEETS[destination]
-            move_row(
-                conn, ss_client,
-                source_sheet_id=main_sheet_id,
-                source_row=row,
-                columns_by_id=columns_by_id,
-                target_sheet_id=target_sheet_id,
-                client_slug="bridge",
-                route_value=route_value,
-            )
-            stats["rows_moved"] = stats.get("rows_moved", 0) + 1
-            logger.info("Bridge multi-leg: final delivery approved, row %s moved to %s (%s)",
-                        row.id, destination, target_sheet_id)
+    if delivery_col_id is None:
+        return True
+    delivery_cell = cells_by_col.get(delivery_col_id)
+    delivery_value = (delivery_cell.display_value or delivery_cell.value) if delivery_cell else None
+    if not delivery_value or str(delivery_value).strip().casefold() != "approved":
+        return True
 
+    if _bridge_adhoc_tagging_triggered(cells_by_col, columns_by_id):
+        move_row(
+            conn, ss_client,
+            source_sheet_id=main_sheet_id,
+            source_row=row,
+            columns_by_id=columns_by_id,
+            target_sheet_id=BRIDGE_ADHOC_TAGGING,
+            client_slug="bridge",
+        )
+        stats["rows_moved"] = stats.get("rows_moved", 0) + 1
+        logger.info("Bridge: final delivery approved, row %s moved to ADHOC TAGGING (override)", row.id)
+        return True
+
+    filled_countries = []
+    for country, (date_col_name, target_sheet_id) in BRIDGE_FINAL_DESTINATION_DATE_COLUMNS.items():
+        date_col_id = name_to_id.get(date_col_name)
+        if date_col_id is None:
+            continue
+        cell = cells_by_col.get(date_col_id)
+        value = (cell.display_value or cell.value) if cell else None
+        if value and str(value).strip():
+            filled_countries.append(country)
+
+    if len(filled_countries) != 1:
+        stats["bridge_final_destination_ambiguous"] = stats.get("bridge_final_destination_ambiguous", 0) + 1
+        logger.warning(
+            "Bridge: row %s has final delivery approved but %s of TAN/NAM/SA/MOZ arrival dates filled (%s) -- skipping, flagged for review",
+            row.id, len(filled_countries), filled_countries,
+        )
+        _alert_bridge_final_destination_ambiguous(conn, row.id, filled_countries)
+        return True
+
+    destination = filled_countries[0]
+    _, target_sheet_id = BRIDGE_FINAL_DESTINATION_DATE_COLUMNS[destination]
+    move_row(
+        conn, ss_client,
+        source_sheet_id=main_sheet_id,
+        source_row=row,
+        columns_by_id=columns_by_id,
+        target_sheet_id=target_sheet_id,
+        client_slug="bridge",
+    )
+    stats["rows_moved"] = stats.get("rows_moved", 0) + 1
+    logger.info("Bridge: final delivery approved, row %s moved to %s (%s)", row.id, destination, target_sheet_id)
     return True
 
 
@@ -426,11 +465,10 @@ def _process_bridge_multi_leg_row(conn, ss_client, main_sheet_id: int, row, colu
 # (GSM-DRC-DBN, GSM-KAZ-DBN, GSM-MOKAMBO-DBN, GSM-GRB-DBN,
 # GOLDVALE-COMMUS-DBN, GOLDVALE-KAMOA MINE-DBN, GOLDVALE-LCS-DBN) were
 # deleted the same day these new country sheets were created -- so unlike
-# Bridge (where only 14 of many ROUTE values get this treatment and the
-# rest still flow through resolve_target_sheet_id() normally), GSM and
-# Gold Vale ROUTE values never reach resolve_target_sheet_id() at all
-# anymore; there's nothing left in their invoicing folders for it to
-# match against.
+# Bridge (which is now also fully diverted before ROUTE matching, as of
+# 2026-09-23), GSM and Gold Vale ROUTE values never reach
+# resolve_target_sheet_id() at all anymore; there's nothing left in
+# their invoicing folders for it to match against.
 #
 # SA is deliberately NOT one of the three country-leg approval columns
 # here (unlike DRC/ZAM/BOTS) -- per Jay, the existing final-delivery
@@ -645,7 +683,9 @@ def _find_approval_column(columns_by_id: dict[int, str]) -> int | None:
     each sheet (after the pre-existing final approval column) -- but that
     was luck of column order, not something to rely on, hence this fix
     plus moving the per-client multi-leg/country-leg check to run BEFORE
-    this generic gate in process_sheet() (see that function)."""
+    this generic gate in process_sheet() (see that function). Bridge is
+    fully diverted before this function is even reached as of 2026-09-23,
+    but the exclusion regex stays -- GSM/Gold Vale still rely on it."""
     for col_id, title in columns_by_id.items():
         normalized = title.strip().casefold()
         if normalized == "load approval status":
@@ -895,18 +935,18 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
     if a target sheet turns out to be full, every other row destined for
     it this run is skipped immediately instead of individually retried.
 
-    Per-client multi-leg/country-leg check (2026-09-16): Bridge's 14
-    multi-leg routes and GSM/Gold Vale's country-leg treatment each do
-    their OWN internal per-column approval gating (DRC/ZAM/BOTS/final
-    REGION: Approval columns, checked individually inside those
-    functions) -- so they run BEFORE the single generic approval_value
-    gate below, not after. The generic gate assumes one approval column
-    per sheet; these three clients now have several, so applying the
-    generic gate first would filter every row on whichever REGION:
-    Approval column _find_approval_column() happens to pick, silently
-    skipping rows that still need earlier-leg processing before that
-    column is ever set. See _find_approval_column()'s docstring for the
-    related fix this pairs with.
+    Per-client multi-leg/country-leg check (2026-09-16, Bridge rebuilt
+    2026-09-23): Bridge's country-leg treatment and GSM/Gold Vale's
+    country-leg treatment each do their OWN internal per-column approval
+    gating (DRC/ZAM/ZIM/BOTS/final REGION: Approval columns, checked
+    individually inside those functions) -- so they run BEFORE the single
+    generic approval_value gate below, not after. The generic gate
+    assumes one approval column per sheet; these clients now have
+    several, so applying the generic gate first would filter every row on
+    whichever REGION: Approval column _find_approval_column() happens to
+    pick, silently skipping rows that still need earlier-leg processing
+    before that column is ever set. See _find_approval_column()'s
+    docstring for the related fix this pairs with.
     """
     stats = {"rows_checked": 0, "rows_moved": 0, "rows_skipped_no_route": 0,
               "rows_skipped_not_approved": 0, "rows_failed_resolve": 0, "skipped_known_bad_target": 0}
@@ -950,11 +990,11 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
             continue
         route_value = str(route_value)
 
-        # Bridge multi-leg and GSM/Gold Vale country-leg handling both run
-        # BEFORE the generic approval gate -- see this function's
+        # Bridge country-leg and GSM/Gold Vale country-leg handling both
+        # run BEFORE the generic approval gate -- see this function's
         # docstring and _find_approval_column()'s docstring for why.
-        if client_slug == "bridge" and _process_bridge_multi_leg_row(
-            conn, ss_client, main_sheet_id, row, columns_by_id, route_value, stats
+        if client_slug == "bridge" and _process_bridge_country_leg_row(
+            conn, ss_client, main_sheet_id, row, columns_by_id, stats
         ):
             continue
         if _process_gsm_goldvale_country_leg_row(
@@ -980,15 +1020,7 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
             commodity_value = (commodity_cell.display_value or commodity_cell.value) if commodity_cell else None
             commodity_value = str(commodity_value) if commodity_value else None
 
-        # Bridge Adhoc Tagging override, 2026-09-16 (per Jay): TAGGING
-        # ONLY on ANY of Bridge's 9 region SERVICES REQUIRED columns
-        # redirects here regardless of what ROUTE says -- checked before
-        # normal resolution, not part of resolve_target_sheet_id's
-        # ROUTE-keyed logic.
-        if client_slug == "bridge" and _bridge_adhoc_tagging_triggered(cells_by_col, columns_by_id):
-            target_sheet_id, reason = BRIDGE_ADHOC_TAGGING, "Bridge Adhoc Tagging override"
-        else:
-            target_sheet_id, reason = resolve_target_sheet_id(route_value, local_route_value, folder_cache, commodity_value)
+        target_sheet_id, reason = resolve_target_sheet_id(route_value, local_route_value, folder_cache, commodity_value)
         if target_sheet_id is None:
             stats["rows_failed_resolve"] += 1
             logger.warning(
