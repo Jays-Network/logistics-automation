@@ -1,6 +1,14 @@
 """RELOAD -- ROUTE 'Reload-DRC-LOCAL' is resolved via the LOCAL ROUTE column."""
 
-from ..util import norm
+from ..shared import folder_match
+from ..util import client_logger, norm
+
+CLIENT_SLUG = "reload"
+MAIN_SHEET_ID = 1307544392781700
+INVOICING_FOLDER_ID = 2409098722469764
+ROUTE_PREFIXES = ("reload",)
+
+log = client_logger(CLIENT_SLUG)
 
 # RELOAD's special case: when ROUTE == "Reload-DRC-LOCAL", the LOCAL ROUTE
 # column (not ROUTE) determines the real target — one of 4 sheets. Confirmed
@@ -67,7 +75,7 @@ RELOAD_LOCAL_ROUTE_MAP.update({
 })
 
 
-def resolve(local_route_value):
+def _resolve_local_route(local_route_value):
     """Returns (sheet_id_or_None, reason) -- same contract as resolve_target_sheet_id()."""
     if not local_route_value or not local_route_value.strip():
         return None, "RELOAD-DRC-LOCAL but LOCAL ROUTE column is blank"
@@ -76,3 +84,28 @@ def resolve(local_route_value):
     if sheet_id is None:
         return None, f"RELOAD LOCAL ROUTE value not in known map: {local_route_value!r}"
     return sheet_id, "RELOAD local route map"
+
+
+def process_row(conn, ss_client, main_sheet_id, row, columns_by_id, stats, **ctx) -> bool:
+    """No custom per-row flow for this client."""
+    return False
+
+
+SELFTEST_CASES = [("Reload-DRC-LOCAL", local, None, sheet_id) for local, sheet_id in RELOAD_LOCAL_ROUTE_MAP.items()] + [
+    ("Reload-DRC-DAR", None, None, 1618272775524228),
+    ("Reload-RGT-WVB", None, None, 5245664714772356),
+    ("Reload-DRC-Ndola", None, None, 4187882989244292),
+]
+
+
+def resolve(route_value, local_route_value, commodity_value, folder_cache):
+    """Returns (sheet_id_or_None, reason)."""
+    # 1. ROUTE 'Reload-DRC-LOCAL' is resolved by the LOCAL ROUTE column (map above).
+    if norm(route_value) == RELOAD_TRIGGER_ROUTE:
+        return _resolve_local_route(local_route_value)
+    # 2. Any other ROUTE: whole value must equal a sheet name in the folder.
+    sheet_id, reason = folder_match.resolve_in_folder(
+        CLIENT_SLUG, ROUTE_PREFIXES, INVOICING_FOLDER_ID, route_value, folder_cache)
+    if sheet_id is None:
+        log.debug("step 2 (folder match) failed: %s", reason)
+    return sheet_id, reason

@@ -77,6 +77,36 @@ INVOICING_FOLDERS: dict[str, int] = {
 }
 
 
+# client_slug -> (archive sheet_id, archive sheet name). The "marked as such"
+# archive sheet of every invoicing folder, confirmed live 2026-10-28 (each folder
+# holds exactly ONE archive sheet; every other sheet in the folder, new ones
+# included, is a source that archives into it). Used only to self-heal a missing
+# approval_router_archive_state row (see _ensure_archive_state_row) -- the DB row
+# stays the thing the router actually reads.
+KNOWN_ARCHIVE_SHEETS: dict[str, tuple[int, str]] = {
+    "alistair":               (3585932048420740, "ALISTAIR Archive"),
+    "reload":                 (4575928452599684, "RELOAD Archive"),
+    "glencore_international": (1128742603673476, "GLENCORE INTERNATIONAL Archive"),
+    "fh_bertling":            (771182281314180,  "FH BERTLING Archive"),
+    "bridge":                 (8390292397838212, "BRIDGE Archive"),
+    "goldvale":               (4856896623169412, "GOLDVALE Archive"),
+    "gsm":                    (7748094660661124, "GSM Archive"),
+    "ixm":                    (7179872634883972, "IXM Archive"),
+    "mittal":                 (8307299402600324, "MITTAL Archive"),
+    "sls_africa":             (3659921450028932, "SLS AFRICA Archive"),
+    "sls_trading":            (6339218686037892, "SLS TRADING Archive"),
+    "zalawi":                 (6622194753818500, "ZALAWI Archive"),
+    "glencore":               (4364822220066692, "GLENCORE Archive"),
+    "alliance":               (7348488238223236, "Arcive Alliance invoicing"),
+}
+
+
+def _client_log(client_slug: str):
+    """One logger per client ('approval_router.archive_router.<slug>') so every
+    archive log line names the client it belongs to."""
+    return logging.getLogger(f"approval_router.archive_router.{client_slug}")
+
+
 MAX_SHEET_NAME_LENGTH = 50
 
 
@@ -391,6 +421,32 @@ def _update_archive_sheet_state(conn, sheet_id: int, client_slug: str, version: 
     conn.commit()
 
 
+def _ensure_archive_state_row(conn, client_slug: str, sheets_in_folder: list):
+    """If a client has NO active archive row in approval_router_archive_state, create it
+    from KNOWN_ARCHIVE_SHEETS -- but only when that sheet is really present in the
+    client's invoicing folder, so a wrong id can never be registered. Returns the
+    active row (dict) or None."""
+    active = _get_active_archive(conn, client_slug)
+    if active is not None:
+        return active
+    known = KNOWN_ARCHIVE_SHEETS.get(client_slug)
+    clog = _client_log(client_slug)
+    if known is None:
+        return None
+    sheet_id, sheet_name = known
+    if not any(sh.id == sheet_id for sh in sheets_in_folder):
+        clog.error("KNOWN archive sheet %s (%r) is not in the invoicing folder -- NOT registering it", sheet_id, sheet_name)
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO approval_router_archive_state (client_slug, sheet_id, sheet_name, is_active) "
+            "VALUES (%s, %s, %s, true)", (client_slug, sheet_id, sheet_name))
+    conn.commit()
+    clog.warning("no active archive row existed -- registered %r (%s) from KNOWN_ARCHIVE_SHEETS", sheet_name, sheet_id)
+    _log_alert(conn, f"📦 *archive_router*: registered the missing archive row for *{client_slug}* -> `{sheet_name}` ({sheet_id})")
+    return _get_active_archive(conn, client_slug)
+
+
 def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug: str, folder_id: int,
                            moves_left: int = MAX_MOVES_PER_RUN) -> dict[str, int]:
     """
@@ -408,12 +464,15 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
     stats = {"sheets_checked": 0, "rows_checked": 0, "rows_moved": 0, "rows_failed": 0,
              "rotations": 0, "sheets_incomplete": 0}
 
-    active_archive = _get_active_archive(conn, client_slug)
+    clog = _client_log(client_slug)
+    active_archive = _ensure_archive_state_row(conn, client_slug, sheets_in_folder)
     if active_archive is None:
-        logger.error("No active archive sheet found in DB for %s — skipping client entirely", client_slug)
+        clog.error("No active archive sheet found in DB for %s — skipping client entirely", client_slug)
         return stats
     archive_sheet_id = active_archive["sheet_id"]
     archive_ids = _known_archive_ids(conn, client_slug) | {archive_sheet_id}
+    clog.info("archive for %s -> %r (%s); %s source sheet(s) in folder", client_slug,
+              active_archive["sheet_name"], archive_sheet_id, len([x for x in sheets_in_folder if x.id not in archive_ids]))
 
     for sheet_summary in sheets_in_folder:
         if sheet_summary.id in archive_ids:
@@ -440,8 +499,12 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
             None,
         )
         if archive_col_id is None:
+            # Was skipped silently. A NEW sheet (e.g. built from a template without the
+            # Archive checkbox) would then never archive anything and nobody would know.
+            clog.warning("sheet %r (%s) has NO '%s' checkbox column -- nothing on it can be archived",
+                         sheet_summary.name, sheet_summary.id, ARCHIVE_CHECKBOX_COLUMN)
             _update_archive_sheet_state(conn, sheet_summary.id, client_slug, current_version)
-            continue  # no Archive column on this sheet — skip silently, not every sheet needs one
+            continue
 
         sheet_incomplete = False
         for row in sheet.rows:
@@ -460,12 +523,12 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
                 break  # cap reached mid-sheet; leave the sheet dirty
 
             if _row_failed_attempts(conn, sheet_summary.id, row.id) >= MAX_ROW_ATTEMPTS:
-                logger.warning("Row %s on sheet %s failed %s times in 24h — not retrying (see row_move_log)",
+                clog.warning("Row %s on sheet %s failed %s times in 24h — not retrying (see row_move_log)",
                                 row.id, sheet_summary.id, MAX_ROW_ATTEMPTS)
                 continue  # given up for now; does not hold the sheet dirty forever
 
             if DRY_RUN:
-                logger.info("DRY RUN: would archive row %s from %r (%s) -> archive sheet %s",
+                clog.info("DRY RUN: would archive row %s from %r (%s) -> archive sheet %s",
                              row.id, sheet_summary.name, sheet_summary.id, archive_sheet_id)
                 stats["rows_moved"] += 1
                 sheet_incomplete = True  # never checkpoint in a dry run
@@ -490,13 +553,13 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
                 move_log = cur.fetchone()
 
             if move_log and move_log["status"] == "error" and move_log["error_code"] == SHEET_FULL_ERROR_CODE:
-                logger.warning("Archive sheet full for %s (sheet_id=%s) — rotating", client_slug, archive_sheet_id)
+                clog.warning("Archive sheet full for %s (sheet_id=%s) — rotating", client_slug, archive_sheet_id)
                 try:
                     archive_sheet_id = _rotate_archive_sheet(conn, ss_client, client_slug, archive_sheet_id, folder_id)
                     archive_ids.add(archive_sheet_id)
                     stats["rotations"] += 1
                 except ArchiveRouterError as exc:
-                    logger.error("Rotation failed for %s: %s — row %s left unarchived, will retry next run",
+                    clog.error("Rotation failed for %s: %s — row %s left unarchived, will retry next run",
                                  client_slug, exc, row.id)
                     stats["rows_failed"] += 1
                     sheet_incomplete = True
@@ -521,7 +584,7 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
                 stats["rows_failed"] += 1
                 sheet_incomplete = True
                 attempts = _row_failed_attempts(conn, sheet_summary.id, row.id)
-                logger.error("Archive move FAILED for row %s on sheet %s (%s) — attempt %s/%s, move_log_id=%s",
+                clog.error("Archive move FAILED for row %s on sheet %s (%s) — attempt %s/%s, move_log_id=%s",
                               row.id, sheet_summary.id, sheet_summary.name, attempts, MAX_ROW_ATTEMPTS, move_log_id)
                 if attempts == MAX_ROW_ATTEMPTS:
                     _log_alert(conn,

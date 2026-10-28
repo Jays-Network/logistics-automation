@@ -1,5 +1,16 @@
 """Glencore International -- ROUTE values grouped onto per-mine invoicing sheets."""
 
+from ..shared import folder_match
+from ..util import client_logger, norm
+
+CLIENT_SLUG = "glencore_international"
+MAIN_SHEET_ID = 3849491978342276
+INVOICING_FOLDER_ID = 7194173326550916
+ROUTE_PREFIXES = ("glencore international",)   # normalized text before the first '-'
+
+log = client_logger(CLIENT_SLUG)
+
+
 GLENCORE_FIMPIMPA = 7949082489474948
 GLENCORE_KANSANSHI = 6824445303017348
 GLENCORE_KCM = 628035855536004
@@ -92,3 +103,26 @@ ROUTE_OVERRIDES.update({
         "Glencore international-Polytra-GRB",
     )
 })
+
+
+def process_row(conn, ss_client, main_sheet_id, row, columns_by_id, stats, **ctx) -> bool:
+    """No custom per-row flow for this client."""
+    return False
+
+
+# Snapshot cases: every override must land on its sheet; one plain case shows the folder-match step.
+SELFTEST_CASES = [(route, None, None, sheet_id) for route, sheet_id in ROUTE_OVERRIDES.items()]
+
+
+def resolve(route_value, local_route_value, commodity_value, folder_cache):
+    """Returns (sheet_id_or_None, reason)."""
+    normalized_route = norm(route_value)
+    # 1. Known override table (many ROUTE values -> one mine sheet).
+    if normalized_route in ROUTE_OVERRIDES:
+        return ROUTE_OVERRIDES[normalized_route], "known override"
+    # 2. Otherwise the whole ROUTE must equal a sheet name in the folder.
+    sheet_id, reason = folder_match.resolve_in_folder(
+        CLIENT_SLUG, ROUTE_PREFIXES, INVOICING_FOLDER_ID, route_value, folder_cache)
+    if sheet_id is None:
+        log.debug("step 2 (folder match) failed: %s", reason)
+    return sheet_id, reason

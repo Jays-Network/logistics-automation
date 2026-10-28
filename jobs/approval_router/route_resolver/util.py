@@ -77,3 +77,13 @@ class FolderSheetCache:
                 norm(sheet.name): sheet.id for sheet in (folder.sheets or [])
             }
         return self._cache[folder_id]
+
+
+def client_logger(client_slug: str):
+    """One logger per client: 'approval_router.route_resolver.<slug>'.
+
+    Every client file logs through its own logger, so a line in the log names
+    the client (and therefore the file clients/<slug>.py) that produced it. It is
+    a child of 'approval_router.route_resolver', so existing handlers/format apply."""
+    import logging
+    return logging.getLogger(f"approval_router.route_resolver.{client_slug}")

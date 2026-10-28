@@ -47,14 +47,20 @@ genuinely different, actively-used operation with its own sheet structure
 (no single main-sheet + ROUTE + approval pattern) — confirmed with Jay
 2026-09-13 that it's out of scope. It's simply not in MAIN_SHEETS below.
 
-Layout (split from the old single route_resolver.py):
+Layout:
     __main__.py        single entry point:  python -m jobs.approval_router.route_resolver
     runner.py          main(): lock, DB connection, loop over clients
-    processor.py       process_sheet(): per-sheet row loop + diversion to client flows
-    resolver.py        ROUTE -> target sheet (overrides, RELOAD, IXM, folder match)
-    config.py          MAIN_SHEETS registry, JOB_NAME, lock settings
-    clients/           one file per client's special rules and sheet IDs
+    processor.py       process_sheet(): per-sheet row loop; hands each row to the client's file
+    resolver.py        picks the client's file and calls its resolve() (crashes are traced to it)
+    clients/<slug>.py  ONE FILE PER CLIENT (12): sheet ids, ROUTE rules, own logger, self-test cases
+    shared/            generic folder match + the country-leg engine (called from the client files)
+    settings.py        JOB_NAME, lock settings;  config.py builds MAIN_SHEETS from the client files
+    selftest.py        python -m jobs.approval_router.route_resolver.selftest [--live] [client]
     util.py alerts.py db.py lock.py   shared helpers
+
+Debugging a failure: every log line from a client carries the logger name
+'approval_router.route_resolver.<slug>' (and reasons are prefixed '[<slug>]'), which
+maps 1:1 to clients/<slug>.py. Run the self-test for just that client.
 """
 
 from dotenv import load_dotenv

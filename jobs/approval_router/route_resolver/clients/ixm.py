@@ -1,6 +1,14 @@
 """IXM -- ROUTE 'IXM-Lonshi-Dar' is split by the COMMODITY column."""
 
-from ..util import norm
+from ..shared import folder_match
+from ..util import client_logger, norm
+
+CLIENT_SLUG = "ixm"
+MAIN_SHEET_ID = 6551095343009668
+INVOICING_FOLDER_ID = 5012742257043332
+ROUTE_PREFIXES = ("ixm",)
+
+log = client_logger(CLIENT_SLUG)
 
 # IXM's commodity split, 2026-09-16 (per Jay): ROUTE stays "IXM-Lonshi-Dar"
 # unchanged -- the new COMMODITY column (PICKLIST, confirmed live: exactly
@@ -18,7 +26,7 @@ IXM_COMMODITY_MAP: dict[str, int] = {
 }
 
 
-def resolve(commodity_value):
+def _resolve_commodity(commodity_value):
     """Returns (sheet_id_or_None, reason) -- same contract as resolve_target_sheet_id()."""
     if not commodity_value or not commodity_value.strip():
         return None, "IXM-Lonshi-Dar but COMMODITY column is blank"
@@ -27,3 +35,27 @@ def resolve(commodity_value):
     if sheet_id is None:
         return None, f"IXM COMMODITY value not in known map: {commodity_value!r}"
     return sheet_id, "IXM commodity map"
+
+
+def process_row(conn, ss_client, main_sheet_id, row, columns_by_id, stats, **ctx) -> bool:
+    """No custom per-row flow for this client."""
+    return False
+
+
+SELFTEST_CASES = [
+    ("IXM-Lonshi-Dar", None, "COPPER CATHODES", IXM_COPPER_CATHODES),
+    ("IXM-Lonshi-Dar", None, "COPPER CONCENTRATE", IXM_COPPER_CONCENTRATE),
+]
+
+
+def resolve(route_value, local_route_value, commodity_value, folder_cache):
+    """Returns (sheet_id_or_None, reason)."""
+    # 1. The one live ROUTE ("IXM-Lonshi-Dar") is split by the COMMODITY column.
+    if norm(route_value) == IXM_TRIGGER_ROUTE:
+        return _resolve_commodity(commodity_value)
+    # 2. Any other ROUTE: whole value must equal a sheet name in the folder.
+    sheet_id, reason = folder_match.resolve_in_folder(
+        CLIENT_SLUG, ROUTE_PREFIXES, INVOICING_FOLDER_ID, route_value, folder_cache)
+    if sheet_id is None:
+        log.debug("step 2 (folder match) failed: %s", reason)
+    return sheet_id, reason

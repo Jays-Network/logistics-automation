@@ -8,7 +8,7 @@ import logging
 import os
 import time
 
-from .config import LOCK_FILE, LOCK_STALE_SECONDS
+from .settings import LOCK_FILE, LOCK_STALE_SECONDS
 
 logger = logging.getLogger("approval_router.route_resolver")
 

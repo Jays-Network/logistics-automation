@@ -7,7 +7,8 @@ from jobs.approval_router.backup import get_connection
 from jobs.approval_router.mover import get_smartsheet_client
 
 from . import lock
-from .config import MAIN_SHEETS, JOB_NAME
+from .config import MAIN_SHEETS
+from .settings import JOB_NAME
 from .db import start_job_run, finish_job_run
 from .processor import process_sheet
 from .util import FolderSheetCache

@@ -5,7 +5,7 @@ import logging
 from jobs.approval_router.mover import move_row, get_move_log, SHEET_FULL_ERROR_CODE
 
 from .alerts import alert_unresolvable_route
-from .clients import bridge, gsm_goldvale
+from .clients import CLIENTS
 from .db import (get_unresolved_rows, upsert_unresolved, clear_unresolved,
                  get_sheet_delta_state, update_sheet_delta_state)
 from .lock import touch_lock
@@ -34,7 +34,7 @@ def process_sheet(conn, ss_client, folder_cache: "FolderSheetCache", client_slug
     if a target sheet turns out to be full, every other row destined for
     it this run is skipped immediately instead of individually retried.
 
-    Per-client multi-leg/country-leg check (2026-09-16, Bridge rebuilt
+    Per-client flow hook (clients/<slug>.py process_row): multi-leg/country-leg check (2026-09-16, Bridge rebuilt
     2026-09-23): Bridge's country-leg treatment and GSM/Gold Vale's
     country-leg treatment each do their OWN internal per-column approval
     gating (DRC/ZAM/ZIM/BOTS/final REGION: Approval columns, checked
@@ -74,7 +74,8 @@ def process_sheet(conn, ss_client, folder_cache: "FolderSheetCache", client_slug
         logger.error("No approval column found on %s main sheet (sheet_id=%s) — skipping", client_slug, main_sheet_id)
         return stats
 
-    ambiguous_bridge: list = []
+    module = CLIENTS[client_slug]        # the client's own file (clients/<slug>.py)
+    sheet_ctx = {"ambiguous": []}        # scratch space a client file may use across rows
     rows_errored = 0
 
     for row in sheet.rows:
@@ -99,16 +100,12 @@ def process_sheet(conn, ss_client, folder_cache: "FolderSheetCache", client_slug
                 continue
             route_value = str(route_value)
 
-            # Bridge country-leg and GSM/Gold Vale country-leg handling both
-            # run BEFORE the generic approval gate -- see this function's
-            # docstring and find_approval_column()'s docstring for why.
-            if client_slug == "bridge" and bridge.process_bridge_country_leg_row(
+            # Clients with their own per-row flow (Bridge, GSM, Gold Vale country legs)
+            # run BEFORE the generic approval gate -- see this function's docstring and
+            # find_approval_column()'s docstring for why. Plain clients return False.
+            if module.process_row(
                 conn, ss_client, main_sheet_id, row, columns_by_id, stats,
-                route_value=route_value, ambiguous=ambiguous_bridge, unresolved_rows=unresolved_rows,
-            ):
-                continue
-            if gsm_goldvale.process_gsm_goldvale_country_leg_row(
-                conn, ss_client, client_slug, main_sheet_id, row, columns_by_id, stats
+                route_value=route_value, sheet_ctx=sheet_ctx, unresolved_rows=unresolved_rows,
             ):
                 continue
 
@@ -130,7 +127,7 @@ def process_sheet(conn, ss_client, folder_cache: "FolderSheetCache", client_slug
                 commodity_value = (commodity_cell.display_value or commodity_cell.value) if commodity_cell else None
                 commodity_value = str(commodity_value) if commodity_value else None
 
-            target_sheet_id, reason = resolve_target_sheet_id(route_value, local_route_value, folder_cache, commodity_value)
+            target_sheet_id, reason = resolve_target_sheet_id(client_slug, route_value, local_route_value, folder_cache, commodity_value)
             if target_sheet_id is None:
                 stats["rows_failed_resolve"] += 1
                 logger.warning(
@@ -169,7 +166,7 @@ def process_sheet(conn, ss_client, folder_cache: "FolderSheetCache", client_slug
                 conn.rollback()
             except Exception:
                 pass
-            logger.error("Row %s on %s failed unexpectedly (skipping, will retry next run): %s",
+            module.log.error("Row %s on %s failed unexpectedly (skipping, will retry next run): %s",
                          row.id, client_slug, exc, exc_info=True)
             try:
                 upsert_unresolved(conn, main_sheet_id, row.id, client_slug, "", f"unexpected error: {exc}"[:500])
@@ -181,12 +178,13 @@ def process_sheet(conn, ss_client, folder_cache: "FolderSheetCache", client_slug
 
     stats["rows_errored"] = rows_errored
 
-    if ambiguous_bridge:
+    after_sheet = getattr(module, "after_sheet", None)
+    if after_sheet is not None:
         try:
-            bridge.alert_bridge_final_destination_ambiguous(conn, ambiguous_bridge)
+            after_sheet(conn, sheet_ctx)
         except Exception as exc:
             conn.rollback()
-            logger.warning("Bridge ambiguous-row summary alert failed: %s", exc)
+            module.log.warning("after_sheet hook failed: %s", exc)
 
     update_sheet_delta_state(conn, main_sheet_id, client_slug, sheet.name, current_version)
     return stats

@@ -4,7 +4,7 @@ import os
 
 import requests
 
-from .config import JOB_NAME
+from .settings import JOB_NAME
 
 
 def send_telegram(message: str) -> tuple[bool, str | None]:

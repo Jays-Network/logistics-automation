@@ -14,10 +14,17 @@ from jobs.approval_router.copier import copy_row, CopierError
 from jobs.approval_router.mover import move_row, get_move_log
 
 from ..alerts import send_telegram
-from ..config import JOB_NAME
+from ..settings import JOB_NAME
 from ..db import upsert_unresolved, clear_unresolved
 
-logger = logging.getLogger("approval_router.route_resolver")
+from ..util import client_logger
+
+CLIENT_SLUG = "bridge"
+MAIN_SHEET_ID = 4700548271918980
+INVOICING_FOLDER_ID = 1397548024915844
+
+logger = client_logger(CLIENT_SLUG)
+log = logger
 
 BRIDGE_BOTSWANA = 7242925575720836
 BRIDGE_SA = 2880608897552260
@@ -523,3 +530,32 @@ def process_bridge_country_leg_row(conn, ss_client, main_sheet_id: int, row, col
         clear_unresolved(conn, main_sheet_id, row.id)
         logger.info("Bridge: final delivery approved, row %s moved to %s (%s)", row.id, destination, target_sheet_id)
     return True
+
+
+
+# ---------------------------------------------------------------------------
+# Client contract (see clients/__init__.py). Bridge is fully diverted into the
+# country-leg flow above, so ROUTE matching is never used for it.
+# ---------------------------------------------------------------------------
+SELFTEST_CASES: list = []   # Bridge never resolves a ROUTE to one sheet
+
+
+def process_row(conn, ss_client, main_sheet_id, row, columns_by_id, stats, **ctx) -> bool:
+    """Country-leg flow. Always handles the row (returns True)."""
+    return process_bridge_country_leg_row(
+        conn, ss_client, main_sheet_id, row, columns_by_id, stats,
+        route_value=ctx.get("route_value"),
+        ambiguous=ctx["sheet_ctx"]["ambiguous"],
+        unresolved_rows=ctx.get("unresolved_rows"),
+    )
+
+
+def after_sheet(conn, sheet_ctx):
+    """One summary alert per run for rows whose final destination was ambiguous."""
+    if sheet_ctx.get("ambiguous"):
+        alert_bridge_final_destination_ambiguous(conn, sheet_ctx["ambiguous"])
+
+
+def resolve(route_value, local_route_value, commodity_value, folder_cache):
+    """Bridge rows never reach ROUTE matching (diverted in process_row)."""
+    return None, "Bridge uses the country-leg flow, not ROUTE matching"
