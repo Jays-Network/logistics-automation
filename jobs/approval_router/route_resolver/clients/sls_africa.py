@@ -18,3 +18,9 @@ ROUTE_OVERRIDES.update({
         "SLS Africa-NDOLA-DAR", "SLS Africa-NDOLA-GRB",
     )
 })
+
+# Added 2026-10-28 (per Jay): two new routes. NO code needed -- each resolves by
+# the normal folder + exact-sheet-name match once the ROUTE picklist option is
+# added with exactly the same text as the sheet name:
+#   "SLS Africa-NDOLA - WALVIS BAY"  -> sheet_id 4806276258418564
+#   "SLS Africa-SAKANIA - CDM MINE"  -> sheet_id 6356484574367620

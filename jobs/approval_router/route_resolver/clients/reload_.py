@@ -58,6 +58,11 @@ RELOAD_LOCAL_ROUTE_MAP.update({
         # Added 2026-10-15 (per Jay): "Kasumbalesa" = the Lubumbashi sheet.
         # Note the live picklist spelling is "KINSENDA-JAS" (not KISENDA/KAS).
         "reload-kinsenda-jas",
+        # Added 2026-10-28 (per Jay): SURYA is Lubumbashi. The LOCAL ROUTE
+        # picklist option did not exist yet when this was added, so the exact
+        # live spelling is unconfirmed -- the plausible hyphen/space variants
+        # are all listed (matching is already case/extra-space tolerant).
+        "reload-surya - kas", "reload-surya-kas", "reload-surya- kas",
     )
 })
 

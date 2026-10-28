@@ -9,6 +9,11 @@ GLENCORE_RGT = 8964850844913540
 GLENCORE_ZANRONG = 4572997676650372
 GLENCORE_ZCCZ = 5130982647877508
 GLENCORE_CCM = 4440228627697540
+# Added 2026-10-28 (per Jay): two new single-route sheets. Named without the
+# destination suffix, like the other group sheets, so each needs an explicit
+# override (the sheet name does not equal the ROUTE value).
+GLENCORE_KASUMBALESA = 5231959057059716   # "Glencore international-Kasumbalesa"
+GLENCORE_POLYTRA = 7552409628004228       # "Glencore international-Polytra"
 
 # route (normalized) -> invoicing sheet_id. Merged into the global override
 # table by resolver.py.
@@ -75,5 +80,15 @@ ROUTE_OVERRIDES.update({
 ROUTE_OVERRIDES.update({
     " ".join(v.split()).casefold(): GLENCORE_CCM for v in (
         "Glencore international-CCM-Beira",
+    )
+})
+ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_KASUMBALESA for v in (
+        "Glencore international-Kasumbalesa-Dar",
+    )
+})
+ROUTE_OVERRIDES.update({
+    " ".join(v.split()).casefold(): GLENCORE_POLYTRA for v in (
+        "Glencore international-Polytra-GRB",
     )
 })
