@@ -57,6 +57,12 @@ Layout (split from the old single route_resolver.py):
     util.py alerts.py db.py lock.py   shared helpers
 """
 
+from dotenv import load_dotenv
+
+# Must run on import, before anything reads os.getenv (DB license key, Smartsheet
+# token, Telegram vars) -- the old single-file module did this at import time too.
+load_dotenv()
+
 from jobs.approval_router.backup import get_connection  # noqa: F401  (kept for diag scripts: rr.get_connection)
 
 from .config import MAIN_SHEETS  # noqa: F401  (jobs/main_to_contractor.py imports this from here)
