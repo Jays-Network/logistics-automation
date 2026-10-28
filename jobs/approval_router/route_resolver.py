@@ -61,7 +61,7 @@ import psycopg2.extras
 
 load_dotenv()
 
-from jobs.approval_router.backup import get_connection, row_to_dict
+from jobs.approval_router.backup import get_connection, row_to_dict, backup_row
 from jobs.approval_router.mover import get_smartsheet_client, move_row, MoverError, get_move_log, SHEET_FULL_ERROR_CODE
 from jobs.approval_router.copier import copy_row, CopierError
 
@@ -309,15 +309,201 @@ def _upsert_bridge_country_copy_log(conn, source_sheet_id, source_row_id, countr
     conn.commit()
 
 
-def _alert_bridge_final_destination_ambiguous(conn, row_id: int, filled_countries: list):
+# What to do when Bridge's final delivery is Approved but NONE of the
+# TAN/NAM/SA/MOZ arrival dates is filled (the journey ended in a copy-stage
+# country -- Zambia, Botswana, Zimbabwe or DRC -- so there is no final
+# destination sheet to move to). Added 2026-10-09 after 226 such rows
+# were found stuck on the tracking sheet.
+#   "flag"   -- (default, safe) leave the row where it is and alert once.
+#   "remove" -- if the row was already copied to a country sheet AND that
+#               copy is confirmed to still exist there, back the row up and
+#               delete it from the tracking sheet. The country-sheet copy
+#               becomes the invoicing record, so nothing is duplicated.
+# Rows with no confirmed copy are ALWAYS flagged, never removed. More than
+# one date filled is always flagged. Flip to "remove" once Jay confirms.
+BRIDGE_ZERO_DATE_ACTION = "remove"   # set by Jay 2026-10-09, subject to the safety checks below
+
+# Safety checks before ANY removal (all must pass, otherwise the row is
+# left in place and flagged):
+#   1. final delivery approval = Approved
+#   2. none of the TAN/NAM/SA/MOZ arrival dates is filled (if one is, the
+#      row is a final-destination row and is MOVED, never removed)
+#   3. NO cell in any TAN/NAM/SA/MOZ "<X> REGION..." column has a value --
+#      any activity there means the row may still be heading to final
+#      approval, so it must not be removed
+#   4. at least one country-sheet copy is logged AND still exists live
+#   5. at most BRIDGE_MAX_REMOVALS_PER_RUN removals per run (blast-radius cap)
+BRIDGE_MAX_REMOVALS_PER_RUN = 100
+# 2026-10-11: country-sheet copies are archived/moved on by another job, so a
+# logged copy is often legitimately gone by the time the row is approved.
+# When True, a row is still removable if EVERY logged copy gives a definite
+# Smartsheet 404 "Not Found" (not a timeout/other error), the copy log says
+# status='copied' with a target_row_id, AND the pre-delete backup is read
+# back and verified. Rows with no logged copy (or only error/null entries)
+# are never removed.
+BRIDGE_ACCEPT_ARCHIVED_COPIES = True
+
+
+def _bridge_final_region_activity(cells_by_col: dict, columns_by_id: dict) -> list:
+    """Names of TAN/NAM/SA/MOZ region columns that hold a value on this row."""
+    prefixes = tuple(
+        name.split(" REGION")[0].strip().upper() + " REGION"
+        for name, _sid in BRIDGE_FINAL_DESTINATION_DATE_COLUMNS.values()
+    )
+    hits = []
+    for col_id, title in columns_by_id.items():
+        if not str(title).strip().upper().startswith(prefixes):
+            continue
+        cell = cells_by_col.get(col_id)
+        value = (cell.display_value or cell.value) if cell else None
+        if value is not None and str(value).strip():
+            hits.append(title)
+    return hits
+
+
+def _bridge_confirmed_copies(conn, ss_client, source_sheet_id: int, source_row_id: int) -> list:
+    """Returns [(country, target_sheet_id, target_row_id)] for this row's
+    logged country-sheet copies that STILL EXIST on the country sheet
+    (re-checked live -- a copy the archive job already moved on doesn't
+    count as a safe record)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT country, target_sheet_id, target_row_id FROM bridge_country_copy_log "
+            "WHERE source_sheet_id = %s AND source_row_id = %s AND status = 'copied' "
+            "AND target_row_id IS NOT NULL",
+            (source_sheet_id, source_row_id),
+        )
+        logged = cur.fetchall()
+    confirmed = []
+    for country, target_sheet_id, target_row_id in logged:
+        try:
+            resp = ss_client.Sheets.get_row(target_sheet_id, target_row_id)
+        except Exception as exc:
+            logger.warning("Bridge: could not verify %s copy of row %s: %s", country, source_row_id, exc)
+            continue
+        if isinstance(resp, smartsheet.models.Error) or getattr(resp, "id", None) is None:
+            continue
+        confirmed.append((country, target_sheet_id, target_row_id))
+    return confirmed
+
+
+def _is_not_found(resp) -> bool:
+    if not isinstance(resp, smartsheet.models.Error):
+        return False
+    result = getattr(resp, "result", None)
+    return getattr(result, "status_code", None) == 404 or getattr(result, "error_code", None) == 1006
+
+
+def _bridge_archived_copies(conn, ss_client, source_sheet_id: int, source_row_id: int) -> list:
+    """[(country, target_sheet_id, target_row_id)] for logged copies whose live
+    check returned a definite 404. Returns [] unless there is at least one
+    such copy AND no logged copy gave an uncertain result (timeout etc.)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT country, target_sheet_id, target_row_id FROM bridge_country_copy_log "
+            "WHERE source_sheet_id = %s AND source_row_id = %s AND status = 'copied' "
+            "AND target_row_id IS NOT NULL",
+            (source_sheet_id, source_row_id),
+        )
+        logged = cur.fetchall()
+    gone = []
+    for country, target_sheet_id, target_row_id in logged:
+        try:
+            resp = ss_client.Sheets.get_row(target_sheet_id, target_row_id)
+        except Exception as exc:
+            logger.warning("Bridge: could not verify %s copy of row %s: %s", country, source_row_id, exc)
+            return []
+        if _is_not_found(resp):
+            gone.append((country, target_sheet_id, target_row_id))
+        elif isinstance(resp, smartsheet.models.Error):
+            return []   # uncertain -> never treat as archived
+        else:
+            return []   # a live copy exists; caller should have used the confirmed path
+    return gone
+
+
+def _bridge_remove_row_after_copy(conn, ss_client, main_sheet_id: int, row, columns_by_id: dict,
+                                   confirmed_copies: list, route_value: str | None) -> bool:
+    """Backs the row up, deletes it from the tracking sheet, and records it
+    in approval_router_row_move_log as status='deleted'. Only called when
+    confirmed_copies is non-empty. Returns True only if the delete
+    succeeded."""
+    country, target_sheet_id, target_row_id = confirmed_copies[-1]
+    row_data = row_to_dict(row, columns_by_id)
+    backup_id = backup_row(conn, main_sheet_id, row.id, "bridge", row_data)
+    conn.commit()
+
+    # Read the backup back and make sure it really holds this row before the
+    # delete. If it doesn't, leave the row alone.
+    with conn.cursor() as cur:
+        cur.execute("SELECT row_data FROM approval_router_row_backup WHERE id = %s", (backup_id,))
+        stored = cur.fetchone()
+    stored_data = stored[0] if stored else None
+    if isinstance(stored_data, str):
+        import json as _json
+        stored_data = _json.loads(stored_data)
+    if not stored_data or stored_data.get("INTERNAL REF:") != row_data.get("INTERNAL REF:"):
+        logger.error("Bridge: backup %s for row %s failed read-back verification -- NOT deleting", backup_id, row.id)
+        return False
+
+    resp = ss_client.Sheets.delete_rows(main_sheet_id, [row.id])
+    if isinstance(resp, smartsheet.models.Error):
+        logger.error("Bridge: delete of row %s failed after backup_id=%s: %s", row.id, backup_id,
+                     getattr(resp.result, "message", resp))
+        return False
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO approval_router_row_move_log "
+                "(backup_id, source_sheet_id, source_row_id, target_sheet_id, target_row_id, "
+                " client_slug, route_value, status) VALUES (%s, %s, %s, %s, %s, 'bridge', %s, 'deleted')",
+                (backup_id, main_sheet_id, row.id, target_sheet_id, target_row_id, route_value),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning("Bridge: row %s deleted (backup_id=%s) but move-log insert failed: %s",
+                       row.id, backup_id, exc)
+    logger.info("Bridge: final delivery approved, no final-country date -- row %s removed from tracking "
+                "(record kept on %s sheet %s, backup_id=%s)", row.id, country, target_sheet_id, backup_id)
+    return True
+
+
+def _bridge_move_checked(conn, ss_client, main_sheet_id: int, row, columns_by_id: dict,
+                          target_sheet_id: int, route_value: str | None) -> bool:
+    """move_row() never raises for a post-backup failure -- it records
+    status='error' and returns. Only report success if the move log says
+    the move actually happened."""
+    move_log_id = move_row(
+        conn, ss_client,
+        source_sheet_id=main_sheet_id,
+        source_row=row,
+        columns_by_id=columns_by_id,
+        target_sheet_id=target_sheet_id,
+        client_slug="bridge",
+        route_value=route_value,
+    )
+    move_log = get_move_log(conn, move_log_id)
+    ok = bool(move_log) and move_log["status"] in ("copied", "verified")
+    if not ok:
+        logger.error("Bridge: move of row %s to sheet %s did NOT succeed (move_log_id=%s, status=%s)",
+                     row.id, target_sheet_id, move_log_id, move_log["status"] if move_log else None)
+    return ok
+
+
+def _alert_bridge_final_destination_ambiguous(conn, ambiguous: list):
     """
-    Alerts once per row per 24h if Bridge's final delivery approval fires
-    but the TAN/NAM/SA/MOZ arrival-date check can't determine a single
-    destination (zero or more than one filled) -- same de-dupe
-    philosophy as _alert_unresolvable_route() below: never re-alert every
-    10-minute cron tick for the same unresolved row.
+    ONE summary alert per run (de-duped to once per 24h) listing every
+    Bridge row whose final delivery is approved but whose final
+    destination could not be determined. Previously this alerted once per
+    row, which meant a bulk approval produced hundreds of Telegram
+    messages. `ambiguous` is a list of (internal_ref, filled_countries,
+    reason) tuples.
     """
-    dedupe_key = f"bridge-final-dest-ambiguous|{row_id}"
+    if not ambiguous:
+        return
+    dedupe_key = "bridge-final-dest-ambiguous-summary"
 
     with conn.cursor() as cur:
         cur.execute(
@@ -328,11 +514,14 @@ def _alert_bridge_final_destination_ambiguous(conn, row_id: int, filled_countrie
         if cur.fetchone():
             return
 
+    sample = "\n".join(f"- {ref}: {reason}" for ref, _filled, reason in ambiguous[:10])
+    more = f"\n...and {len(ambiguous) - 10} more" if len(ambiguous) > 10 else ""
     message = (
-        f"\u26a0\ufe0f *route_resolver*: Bridge final delivery approved but final "
-        f"destination is ambiguous on row `{row_id}`\n"
-        f"TAN/NAM/SA/MOZ arrival dates filled: {filled_countries or 'none'}\n"
-        f"Exactly one must be filled to resolve a destination.\n"
+        f"\u26a0\ufe0f *route_resolver*: {len(ambiguous)} Bridge row(s) approved for final delivery "
+        f"but the final destination can't be determined\n"
+        f"{sample}{more}\n"
+        f"Exactly one of TAN/NAM/SA/MOZ arrival dates must be filled (or the row must have a "
+        f"confirmed country-sheet copy when removal is enabled).\n"
         f"`{dedupe_key}`"
     )
     delivered, delivery_error = _send_telegram(message)
@@ -349,7 +538,9 @@ def _alert_bridge_final_destination_ambiguous(conn, row_id: int, filled_countrie
 
 
 def _process_bridge_country_leg_row(conn, ss_client, main_sheet_id: int, row, columns_by_id: dict,
-                                     stats: dict) -> bool:
+                                     stats: dict, route_value: str | None = None,
+                                     ambiguous: list | None = None,
+                                     unresolved_rows: set | None = None) -> bool:
     """
     Bridge's country-sheet treatment, rebuilt 2026-09-23 (per Jay:
     "convert it to all routes"). Always returns True -- caller must NOT
@@ -394,12 +585,27 @@ def _process_bridge_country_leg_row(conn, ss_client, main_sheet_id: int, row, co
             continue
         try:
             target_row_id = copy_row(ss_client, main_sheet_id, row.id, target_sheet_id)
-            _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, target_row_id, "copied")
-            stats["bridge_country_copies"] = stats.get("bridge_country_copies", 0) + 1
-            logger.info("Bridge: copied row %s to %s sheet %s", row.id, country, target_sheet_id)
         except CopierError as exc:
-            _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, None, "error", str(exc))
+            try:
+                _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, None, "error", str(exc))
+            except Exception as log_exc:
+                conn.rollback()
+                logger.error("Bridge: copy to %s failed for row %s AND the error log write failed: %s", country, row.id, log_exc)
             logger.warning("Bridge: copy to %s failed for row %s: %s", country, row.id, exc)
+            continue
+        # The copy happened. If recording it fails (e.g. a CHECK constraint
+        # on bridge_country_copy_log.country), the row would be re-copied
+        # every run -- so shout loudly with everything needed to reconcile.
+        try:
+            _upsert_bridge_country_copy_log(conn, main_sheet_id, row.id, country, target_sheet_id, target_row_id, "copied")
+        except Exception as log_exc:
+            conn.rollback()
+            logger.critical("Bridge: row %s WAS copied to %s sheet %s (new row %s) but logging it failed: %s "
+                            "-- it WILL be re-copied next run until this is fixed",
+                            row.id, country, target_sheet_id, target_row_id, log_exc)
+            continue
+        stats["bridge_country_copies"] = stats.get("bridge_country_copies", 0) + 1
+        logger.info("Bridge: copied row %s to %s sheet %s", row.id, country, target_sheet_id)
 
     delivery_col_id = name_to_id.get("Siphemandla Hleza delivery approval")
     if delivery_col_id is None:
@@ -407,20 +613,23 @@ def _process_bridge_country_leg_row(conn, ss_client, main_sheet_id: int, row, co
     delivery_cell = cells_by_col.get(delivery_col_id)
     delivery_value = (delivery_cell.display_value or delivery_cell.value) if delivery_cell else None
     if not delivery_value or str(delivery_value).strip().casefold() != "approved":
+        # No longer approved (e.g. flipped to Declined) -- stop re-checking
+        # a row that was previously tracked as unresolved.
+        if unresolved_rows and row.id in unresolved_rows:
+            _clear_unresolved(conn, main_sheet_id, row.id)
         return True
 
     if _bridge_adhoc_tagging_triggered(cells_by_col, columns_by_id):
-        move_row(
-            conn, ss_client,
-            source_sheet_id=main_sheet_id,
-            source_row=row,
-            columns_by_id=columns_by_id,
-            target_sheet_id=BRIDGE_ADHOC_TAGGING,
-            client_slug="bridge",
-        )
-        stats["rows_moved"] = stats.get("rows_moved", 0) + 1
-        logger.info("Bridge: final delivery approved, row %s moved to ADHOC TAGGING (override)", row.id)
+        if _bridge_move_checked(conn, ss_client, main_sheet_id, row, columns_by_id,
+                                BRIDGE_ADHOC_TAGGING, route_value):
+            stats["rows_moved"] = stats.get("rows_moved", 0) + 1
+            _clear_unresolved(conn, main_sheet_id, row.id)
+            logger.info("Bridge: final delivery approved, row %s moved to ADHOC TAGGING (override)", row.id)
         return True
+
+    ref_col_id = name_to_id.get("INTERNAL REF:")
+    ref_cell = cells_by_col.get(ref_col_id) if ref_col_id else None
+    internal_ref = str((ref_cell.display_value or ref_cell.value) if ref_cell else row.id)
 
     filled_countries = []
     for country, (date_col_name, target_sheet_id) in BRIDGE_FINAL_DESTINATION_DATE_COLUMNS.items():
@@ -432,27 +641,51 @@ def _process_bridge_country_leg_row(conn, ss_client, main_sheet_id: int, row, co
         if value and str(value).strip():
             filled_countries.append(country)
 
+    if len(filled_countries) == 0 and BRIDGE_ZERO_DATE_ACTION == "remove":
+        final_activity = _bridge_final_region_activity(cells_by_col, columns_by_id)
+        if final_activity:
+            reason = ("no final arrival date, but final-region data present "
+                      f"({', '.join(final_activity[:3])}) -- may still be heading to final approval")
+        elif stats.get("bridge_removed_after_copy", 0) >= BRIDGE_MAX_REMOVALS_PER_RUN:
+            reason = "removal cap reached this run -- will retry next run"
+        else:
+            confirmed = _bridge_confirmed_copies(conn, ss_client, main_sheet_id, row.id)
+            used_archived = False
+            if not confirmed and BRIDGE_ACCEPT_ARCHIVED_COPIES:
+                confirmed = _bridge_archived_copies(conn, ss_client, main_sheet_id, row.id)
+                used_archived = bool(confirmed)
+            if confirmed:
+                if _bridge_remove_row_after_copy(conn, ss_client, main_sheet_id, row, columns_by_id,
+                                                 confirmed, route_value):
+                    stats["bridge_removed_after_copy"] = stats.get("bridge_removed_after_copy", 0) + 1
+                    _clear_unresolved(conn, main_sheet_id, row.id)
+                    if used_archived:
+                        logger.info("Bridge: row %s removed on ARCHIVED-COPY rule (logged copy 404, backup verified)", row.id)
+                return True
+            reason = "no final date and no confirmed or archived country-sheet copy"
+    elif len(filled_countries) == 0:
+        reason = "no TAN/NAM/SA/MOZ arrival date filled"
+    else:
+        reason = f"more than one final arrival date filled ({', '.join(filled_countries)})"
+
     if len(filled_countries) != 1:
         stats["bridge_final_destination_ambiguous"] = stats.get("bridge_final_destination_ambiguous", 0) + 1
-        logger.warning(
-            "Bridge: row %s has final delivery approved but %s of TAN/NAM/SA/MOZ arrival dates filled (%s) -- skipping, flagged for review",
-            row.id, len(filled_countries), filled_countries,
-        )
-        _alert_bridge_final_destination_ambiguous(conn, row.id, filled_countries)
+        logger.warning("Bridge: row %s (%s) has final delivery approved but %s -- left in place, flagged",
+                       row.id, internal_ref, reason)
+        # Track it as unresolved so it is re-checked every run and clears
+        # itself once the data (or this rule) is fixed -- without this a
+        # row is only re-evaluated if someone edits it.
+        _upsert_unresolved(conn, main_sheet_id, row.id, "bridge", route_value or "", reason)
+        if ambiguous is not None:
+            ambiguous.append((internal_ref, filled_countries, reason))
         return True
 
     destination = filled_countries[0]
     _, target_sheet_id = BRIDGE_FINAL_DESTINATION_DATE_COLUMNS[destination]
-    move_row(
-        conn, ss_client,
-        source_sheet_id=main_sheet_id,
-        source_row=row,
-        columns_by_id=columns_by_id,
-        target_sheet_id=target_sheet_id,
-        client_slug="bridge",
-    )
-    stats["rows_moved"] = stats.get("rows_moved", 0) + 1
-    logger.info("Bridge: final delivery approved, row %s moved to %s (%s)", row.id, destination, target_sheet_id)
+    if _bridge_move_checked(conn, ss_client, main_sheet_id, row, columns_by_id, target_sheet_id, route_value):
+        stats["rows_moved"] = stats.get("rows_moved", 0) + 1
+        _clear_unresolved(conn, main_sheet_id, row.id)
+        logger.info("Bridge: final delivery approved, row %s moved to %s (%s)", row.id, destination, target_sheet_id)
     return True
 
 
@@ -609,12 +842,19 @@ RELOAD_LOCAL_ROUTE_MAP: dict[str, int] = {
         "reload-kamoa - kas", "reload-kamoa - sak", "reload-lcs - kas",
         "reload-mmt - kas", "reload-zfm - kas", "reload-mkm - kas",
         "reload-kas - kamoa", "reload-kms - kas", "reload-kcc - kas",
+        # Added 2026-10-15 (per Jay). Note: no space before hyphen in the
+        # live picklist value "RELOAD-SICO- KAS".
+        "reload-sico- kas",
+        # Added 2026-10-16 (per Jay): MUMI is Kolwezi.
+        "reload-mumi - kas", "reload-mumi - sak",
     )
 }
 RELOAD_LOCAL_ROUTE_MAP.update({
     normalized: RELOAD_LIKASI for normalized in (
         "reload-ruba - mokambo", "reload-ruba mine - kas", "reload-smco - kas",
         "reload-kambove - kas", "reload-kpm - kas",
+        # Added 2026-10-15 (per Jay).
+        "reload-jcm - kas", "reload-excellent-kas", "reload-mjm-kas",
     )
 })
 RELOAD_LOCAL_ROUTE_MAP.update({
@@ -622,11 +862,18 @@ RELOAD_LOCAL_ROUTE_MAP.update({
         "reload-tfm - mokambo", "reload-tfm - kas", "reload-tfm - sak",
         "reload-lamikal - kas", "reload-lamikal - sak", "reload-kfm - mokambo",
         "reload-kisenda - kas",
+        # Added 2026-10-16 (per Jay): KFM is Fungurume.
+        "reload-kfm - kas",
     )
 })
 RELOAD_LOCAL_ROUTE_MAP.update({
     normalized: RELOAD_LUBUMBASHI for normalized in (
         "reload-sem - kas", "reload-kicc - kas",
+        # Added 2026-10-15 (per Jay).
+        "reload-stl - kas",
+        # Added 2026-10-15 (per Jay): "Kasumbalesa" = the Lubumbashi sheet.
+        # Note the live picklist spelling is "KINSENDA-JAS" (not KISENDA/KAS).
+        "reload-kinsenda-jas",
     )
 })
 
@@ -975,90 +1222,138 @@ def process_sheet(conn, ss_client, folder_cache: "_FolderSheetCache", client_slu
         logger.error("No approval column found on %s main sheet (sheet_id=%s) — skipping", client_slug, main_sheet_id)
         return stats
 
+    ambiguous_bridge: list = []
+    rows_errored = 0
+
     for row in sheet.rows:
+        _touch_lock()  # heartbeat: a live run is never mistaken for a zombie
         row_changed = last_checkpoint_at is None or (row.modified_at and row.modified_at > last_checkpoint_at)
         if not row_changed and row.id not in unresolved_rows:
             continue
 
         stats["rows_checked"] += 1
-        cells_by_col = {cell.column_id: cell for cell in row.cells}
 
-        route_cell = cells_by_col.get(route_col_id)
-        route_value = (route_cell.display_value or route_cell.value) if route_cell else None
-        if not route_value or not str(route_value).strip():
-            stats["rows_skipped_no_route"] += 1
-            continue
-        route_value = str(route_value)
+        # One bad row must never abort the whole client (the docstring has
+        # always promised this): log it, roll back any half-finished DB
+        # transaction so later rows aren't poisoned, remember the row so it
+        # is retried next run, and carry on.
+        try:
+            cells_by_col = {cell.column_id: cell for cell in row.cells}
 
-        # Bridge country-leg and GSM/Gold Vale country-leg handling both
-        # run BEFORE the generic approval gate -- see this function's
-        # docstring and _find_approval_column()'s docstring for why.
-        if client_slug == "bridge" and _process_bridge_country_leg_row(
-            conn, ss_client, main_sheet_id, row, columns_by_id, stats
-        ):
-            continue
-        if _process_gsm_goldvale_country_leg_row(
-            conn, ss_client, client_slug, main_sheet_id, row, columns_by_id, stats
-        ):
-            continue
+            route_cell = cells_by_col.get(route_col_id)
+            route_value = (route_cell.display_value or route_cell.value) if route_cell else None
+            if not route_value or not str(route_value).strip():
+                stats["rows_skipped_no_route"] += 1
+                continue
+            route_value = str(route_value)
 
-        approval_cell = cells_by_col.get(approval_col_id)
-        approval_value = (approval_cell.display_value or approval_cell.value) if approval_cell else None
-        if not approval_value or str(approval_value).strip().casefold() != "approved":
-            stats["rows_skipped_not_approved"] += 1
-            continue
+            # Bridge country-leg and GSM/Gold Vale country-leg handling both
+            # run BEFORE the generic approval gate -- see this function's
+            # docstring and _find_approval_column()'s docstring for why.
+            if client_slug == "bridge" and _process_bridge_country_leg_row(
+                conn, ss_client, main_sheet_id, row, columns_by_id, stats,
+                route_value=route_value, ambiguous=ambiguous_bridge, unresolved_rows=unresolved_rows,
+            ):
+                continue
+            if _process_gsm_goldvale_country_leg_row(
+                conn, ss_client, client_slug, main_sheet_id, row, columns_by_id, stats
+            ):
+                continue
 
-        local_route_value = None
-        if local_route_col_id is not None:
-            local_cell = cells_by_col.get(local_route_col_id)
-            local_route_value = (local_cell.display_value or local_cell.value) if local_cell else None
-            local_route_value = str(local_route_value) if local_route_value else None
+            approval_cell = cells_by_col.get(approval_col_id)
+            approval_value = (approval_cell.display_value or approval_cell.value) if approval_cell else None
+            if not approval_value or str(approval_value).strip().casefold() != "approved":
+                stats["rows_skipped_not_approved"] += 1
+                continue
 
-        commodity_value = None
-        if commodity_col_id is not None:
-            commodity_cell = cells_by_col.get(commodity_col_id)
-            commodity_value = (commodity_cell.display_value or commodity_cell.value) if commodity_cell else None
-            commodity_value = str(commodity_value) if commodity_value else None
+            local_route_value = None
+            if local_route_col_id is not None:
+                local_cell = cells_by_col.get(local_route_col_id)
+                local_route_value = (local_cell.display_value or local_cell.value) if local_cell else None
+                local_route_value = str(local_route_value) if local_route_value else None
 
-        target_sheet_id, reason = resolve_target_sheet_id(route_value, local_route_value, folder_cache, commodity_value)
-        if target_sheet_id is None:
-            stats["rows_failed_resolve"] += 1
-            logger.warning(
-                "Could not resolve target for row %s on %s (ROUTE=%r, LOCAL ROUTE=%r, COMMODITY=%r): %s",
-                row.id, client_slug, route_value, local_route_value, commodity_value, reason,
+            commodity_value = None
+            if commodity_col_id is not None:
+                commodity_cell = cells_by_col.get(commodity_col_id)
+                commodity_value = (commodity_cell.display_value or commodity_cell.value) if commodity_cell else None
+                commodity_value = str(commodity_value) if commodity_value else None
+
+            target_sheet_id, reason = resolve_target_sheet_id(route_value, local_route_value, folder_cache, commodity_value)
+            if target_sheet_id is None:
+                stats["rows_failed_resolve"] += 1
+                logger.warning(
+                    "Could not resolve target for row %s on %s (ROUTE=%r, LOCAL ROUTE=%r, COMMODITY=%r): %s",
+                    row.id, client_slug, route_value, local_route_value, commodity_value, reason,
+                )
+                _alert_unresolvable_route(conn, client_slug, route_value, local_route_value, reason)
+                _upsert_unresolved(conn, main_sheet_id, row.id, client_slug, route_value, reason)
+                continue
+
+            _clear_unresolved(conn, main_sheet_id, row.id)
+
+            if target_sheet_id in known_bad_targets_this_run:
+                stats["skipped_known_bad_target"] += 1
+                continue
+
+            move_log_id = move_row(
+                conn, ss_client,
+                source_sheet_id=main_sheet_id,
+                source_row=row,
+                columns_by_id=columns_by_id,
+                target_sheet_id=target_sheet_id,
+                client_slug=client_slug,
+                route_value=route_value,
+                mine_value=local_route_value,
             )
-            _alert_unresolvable_route(conn, client_slug, route_value, local_route_value, reason)
-            _upsert_unresolved(conn, main_sheet_id, row.id, client_slug, route_value, reason)
-            continue
+            move_log = get_move_log(conn, move_log_id)
+            if move_log and move_log["status"] == "error" and move_log.get("error_code") == SHEET_FULL_ERROR_CODE:
+                known_bad_targets_this_run.add(target_sheet_id)
+                logger.warning("Target sheet %s marked bad for the rest of this run", target_sheet_id)
+            stats["rows_moved"] += 1
+            logger.info("Row %s on %s moved (ROUTE=%r) -> move_log_id=%s", row.id, client_slug, route_value, move_log_id)
+        except Exception as exc:
+            rows_errored += 1
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("Row %s on %s failed unexpectedly (skipping, will retry next run): %s",
+                         row.id, client_slug, exc, exc_info=True)
+            try:
+                _upsert_unresolved(conn, main_sheet_id, row.id, client_slug, "", f"unexpected error: {exc}"[:500])
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
-        _clear_unresolved(conn, main_sheet_id, row.id)
+    stats["rows_errored"] = rows_errored
 
-        if target_sheet_id in known_bad_targets_this_run:
-            stats["skipped_known_bad_target"] += 1
-            continue
-
-        move_log_id = move_row(
-            conn, ss_client,
-            source_sheet_id=main_sheet_id,
-            source_row=row,
-            columns_by_id=columns_by_id,
-            target_sheet_id=target_sheet_id,
-            client_slug=client_slug,
-            route_value=route_value,
-            mine_value=local_route_value,
-        )
-        move_log = get_move_log(conn, move_log_id)
-        if move_log and move_log["status"] == "error" and move_log.get("error_code") == SHEET_FULL_ERROR_CODE:
-            known_bad_targets_this_run.add(target_sheet_id)
-            logger.warning("Target sheet %s marked bad for the rest of this run", target_sheet_id)
-        stats["rows_moved"] += 1
-        logger.info("Row %s on %s moved (ROUTE=%r) -> move_log_id=%s", row.id, client_slug, route_value, move_log_id)
+    if ambiguous_bridge:
+        try:
+            _alert_bridge_final_destination_ambiguous(conn, ambiguous_bridge)
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("Bridge ambiguous-row summary alert failed: %s", exc)
 
     _update_sheet_delta_state(conn, main_sheet_id, client_slug, sheet.name, current_version)
     return stats
 
 
 LOCK_FILE = "/opt/jaysnet/logistics-automation/locks/route_resolver.lock"
+# Zombie threshold is measured from the lock's LAST HEARTBEAT (touched on
+# every row), not from when the run started. Previously a long Reload
+# backlog run (>60 min) was treated as a zombie, its lock was cleared, and
+# a second run started on top of it (2026-10-09: 190 duplicate-move 404s).
+LOCK_STALE_SECONDS = 1800
+_LOCK_TOKEN = None
+
+
+def _touch_lock():
+    try:
+        os.utime(LOCK_FILE, None)
+    except OSError:
+        pass
 JOB_NAME = "route_resolver_part1"
 
 
@@ -1108,16 +1403,18 @@ def main():
     """
     if os.path.exists(LOCK_FILE):
         file_age = time.time() - os.path.getmtime(LOCK_FILE)
-        if file_age > 3600:
-            logger.warning("Zombie lock detected (older than 60 min) — clearing it")
+        if file_age > LOCK_STALE_SECONDS:
+            logger.warning("Zombie lock detected (no heartbeat for %s min) — clearing it", int(file_age // 60))
             os.remove(LOCK_FILE)
         else:
             logger.info("route_resolver already running — aborting to avoid overlap")
             return
 
+    global _LOCK_TOKEN
     os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    _LOCK_TOKEN = f"{os.getpid()}-{time.time()}"
     with open(LOCK_FILE, "w") as f:
-        f.write(str(time.time()))
+        f.write(_LOCK_TOKEN)
 
     conn = None
     job_run_id = None
@@ -1151,8 +1448,15 @@ def main():
     finally:
         if conn:
             conn.close()
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
+        # Only remove the lock if it is still OURS -- never delete a lock
+        # that a newer run took over after clearing ours as stale.
+        try:
+            with open(LOCK_FILE) as f:
+                owner_ok = (f.read().strip() == _LOCK_TOKEN)
+            if owner_ok:
+                os.remove(LOCK_FILE)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

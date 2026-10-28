@@ -31,6 +31,7 @@ logging an error.
 
 import os
 import time
+import signal
 import logging
 from typing import Any
 
@@ -65,6 +66,14 @@ INVOICING_FOLDERS: dict[str, int] = {
     "sls_africa":             6807145233573764,
     "sls_trading":            6701592117307268,
     "zalawi":                 6490485884774276,
+    # Added 2026-10-12: the separate GLENCORE folder (not GLENCORE INTERNATIONAL)
+    # was never scanned. Needs an approval_router_archive_state row first
+    # (GLENCORE Archive 4364822220066692) -- see sql note delivered with this patch.
+    "glencore":               3007233047979908,
+    # Added 2026-10-16. Alliance moves tracking -> invoicing via a Smartsheet
+    # approval workflow (not route_resolver), so it is archive-only here.
+    # Needs an approval_router_archive_state row (sql/migrations/019).
+    "alliance":               6083455994881924,
 }
 
 
@@ -84,6 +93,111 @@ def _safe_sheet_name(base: str, suffix: str) -> str:
     if max_base_length < 1:
         raise ArchiveRouterError(f"Suffix {suffix!r} alone exceeds the 50-character sheet name limit")
     return base[:max_base_length] + suffix
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-12 hardening
+#  * sub-folders are scanned (e.g. RELOAD/Reload-DRC-LOCAL)
+#  * a sheet is only marked "checked" when EVERY ticked row on it moved;
+#    failed rows are retried next run (max MAX_ROW_ATTEMPTS per 24h)
+#  * Smartsheet request timeouts + whole-run deadline + lock heartbeat
+#    (same protections as route_resolver.py)
+# ---------------------------------------------------------------------------
+MAX_FOLDER_DEPTH = 4
+MAX_MOVES_PER_RUN = 300        # backlog drains over several hourly runs
+DRY_RUN = os.getenv("ARCHIVE_DRY_RUN") == "1"   # ARCHIVE_DRY_RUN=1 -> log what WOULD move, change nothing
+MAX_ROW_ATTEMPTS = 3           # failed attempts per row per 24h before we stop retrying
+SMARTSHEET_CONNECT_TIMEOUT = 10
+SMARTSHEET_READ_TIMEOUT = 90
+RUN_MAX_SECONDS = 3000         # 50 min ceiling; cron fires hourly
+LOCK_STALE_SECONDS = 1800      # measured from the last heartbeat
+_LOCK_TOKEN = None
+
+
+class _RunDeadline(BaseException):
+    """BaseException on purpose: per-row / per-client `except Exception`
+    blocks must not swallow the deadline."""
+
+
+def _on_run_deadline(signum, frame):
+    raise _RunDeadline(f"run exceeded {RUN_MAX_SECONDS}s")
+
+
+def _apply_request_timeout(ss_client):
+    """The Smartsheet SDK sends requests with no timeout; wrap send()."""
+    session = None
+    for value in list(vars(ss_client).values()):   # __dict__ only: the SDK's __getattr__ fabricates attributes
+        if callable(getattr(value, "send", None)) and callable(getattr(value, "mount", None)):
+            session = value                          # a requests.Session
+            break
+    if session is None:
+        logger.warning("Could not find the Smartsheet HTTP session -- request timeouts NOT applied")
+        return ss_client
+    original_send = session.send
+
+    def send_with_timeout(request, **kwargs):
+        kwargs.setdefault("timeout", (SMARTSHEET_CONNECT_TIMEOUT, SMARTSHEET_READ_TIMEOUT))
+        return original_send(request, **kwargs)
+
+    session.send = send_with_timeout
+    return ss_client
+
+
+def _touch_lock():
+    try:
+        os.utime(LOCK_FILE, None)
+    except OSError:
+        pass
+
+
+def _collect_sheets(ss_client, folder_id: int, depth: int = 0, seen: set | None = None) -> list:
+    """All sheets in a folder INCLUDING nested folders. Returns sheet summaries
+    (objects with .id/.name), de-duplicated by id."""
+    seen = seen if seen is not None else set()
+    folder = ss_client.Folders.get_folder(folder_id)
+    if isinstance(folder, smartsheet.models.Error):
+        raise ArchiveRouterError(f"get_folder({folder_id}) failed: {folder.result.message}")
+    out = []
+    for sh in (folder.sheets or []):
+        if sh.id not in seen:
+            seen.add(sh.id)
+            out.append(sh)
+    if depth < MAX_FOLDER_DEPTH:
+        for sub in (folder.folders or []):
+            if sub.id in seen:
+                continue
+            seen.add(sub.id)
+            out.extend(_collect_sheets(ss_client, sub.id, depth + 1, seen))
+    return out
+
+
+def _known_archive_ids(conn, client_slug: str) -> set:
+    """Every archive sheet ever registered for the client (active or rotated)
+    -- none of them may be scanned as a source."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT sheet_id FROM approval_router_archive_state WHERE client_slug = %s", (client_slug,))
+        return {r[0] for r in cur.fetchall()}
+
+
+def _row_failed_attempts(conn, source_sheet_id: int, source_row_id: int) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM approval_router_row_move_log "
+            "WHERE source_sheet_id = %s AND source_row_id = %s AND route_value IS NULL "
+            "AND status = 'error' AND target_row_id IS NULL "
+            "AND created_at > now() - interval '24 hours'",
+            (source_sheet_id, source_row_id),
+        )
+        return cur.fetchone()[0]
+
+
+def _move_succeeded(conn, move_log_id: int) -> bool:
+    """A row has left the source once the move produced a target_row_id --
+    even if the later verification step logged a mismatch."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT target_row_id FROM approval_router_row_move_log WHERE id = %s", (move_log_id,))
+        r = cur.fetchone()
+    return bool(r and r[0] is not None)
 
 
 class ArchiveRouterError(Exception):
@@ -277,33 +391,37 @@ def _update_archive_sheet_state(conn, sheet_id: int, client_slug: str, version: 
     conn.commit()
 
 
-def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug: str, folder_id: int) -> dict[str, int]:
+def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug: str, folder_id: int,
+                           moves_left: int = MAX_MOVES_PER_RUN) -> dict[str, int]:
     """
-    Scans every non-archive sheet in a client's invoicing folder for rows
-    with the Archive checkbox checked, and moves each one to the client's
-    active archive sheet. Handles full-sheet rotation transparently — the
-    caller doesn't need to know a rotation happened mid-run.
+    Scans every non-archive sheet under a client's invoicing folder (nested
+    folders included) for rows with the Archive checkbox checked, and moves
+    each one to the client's active archive sheet. Handles full-sheet rotation
+    transparently.
 
-    DELTA (2026-09-14): a cheap Sheets.get_sheet_version() check per sheet
-    skips the full row-fetch entirely for sheets that haven't changed
-    since the last run. Once fetched, only rows changed since our last
-    check are evaluated. No "pending unresolved" tracking needed here the
-    way route_resolver.py/main_to_contractor.py got one -- the one known
-    failure mode (a full archive target) already self-heals via automatic
-    rotation within this same call, so nothing is left waiting on an
-    external fix across runs.
+    DELTA: a cheap get_sheet_version() check skips unchanged sheets.
+    A sheet's version/checkpoint is only recorded when EVERY ticked row on it
+    was moved (or deliberately given up on after MAX_ROW_ATTEMPTS). A failed
+    row therefore keeps the sheet "dirty" and is retried on the next run.
+    Only genuinely moved rows count in stats["rows_moved"].
     """
-    stats = {"sheets_checked": 0, "rows_checked": 0, "rows_moved": 0, "rotations": 0}
+    stats = {"sheets_checked": 0, "rows_checked": 0, "rows_moved": 0, "rows_failed": 0,
+             "rotations": 0, "sheets_incomplete": 0}
 
     active_archive = _get_active_archive(conn, client_slug)
     if active_archive is None:
         logger.error("No active archive sheet found in DB for %s — skipping client entirely", client_slug)
         return stats
     archive_sheet_id = active_archive["sheet_id"]
+    archive_ids = _known_archive_ids(conn, client_slug) | {archive_sheet_id}
 
     for sheet_summary in sheets_in_folder:
-        if sheet_summary.id == archive_sheet_id:
-            continue  # never scan the archive sheet itself as a source
+        if sheet_summary.id in archive_ids:
+            continue  # never scan an archive sheet (active or rotated) as a source
+
+        if moves_left - stats["rows_moved"] <= 0:
+            stats["sheets_incomplete"] += 1
+            continue  # per-run cap reached; remaining sheets are picked up next run
 
         current_version = ss_client.Sheets.get_sheet_version(sheet_summary.id).version
         state = _get_archive_sheet_state(conn, sheet_summary.id)
@@ -325,7 +443,9 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
             _update_archive_sheet_state(conn, sheet_summary.id, client_slug, current_version)
             continue  # no Archive column on this sheet — skip silently, not every sheet needs one
 
+        sheet_incomplete = False
         for row in sheet.rows:
+            _touch_lock()  # heartbeat: a live run is never mistaken for a zombie
             if last_checkpoint_at is not None and row.modified_at and row.modified_at <= last_checkpoint_at:
                 continue  # this specific row hasn't changed since our last check
 
@@ -333,6 +453,22 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
             cells_by_col = {cell.column_id: cell for cell in row.cells}
             archive_cell = cells_by_col.get(archive_col_id)
             if not archive_cell or archive_cell.value is not True:
+                continue
+
+            if moves_left - stats["rows_moved"] <= 0:
+                sheet_incomplete = True
+                break  # cap reached mid-sheet; leave the sheet dirty
+
+            if _row_failed_attempts(conn, sheet_summary.id, row.id) >= MAX_ROW_ATTEMPTS:
+                logger.warning("Row %s on sheet %s failed %s times in 24h — not retrying (see row_move_log)",
+                                row.id, sheet_summary.id, MAX_ROW_ATTEMPTS)
+                continue  # given up for now; does not hold the sheet dirty forever
+
+            if DRY_RUN:
+                logger.info("DRY RUN: would archive row %s from %r (%s) -> archive sheet %s",
+                             row.id, sheet_summary.name, sheet_summary.id, archive_sheet_id)
+                stats["rows_moved"] += 1
+                sheet_incomplete = True  # never checkpoint in a dry run
                 continue
 
             move_log_id = move_row(
@@ -357,17 +493,18 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
                 logger.warning("Archive sheet full for %s (sheet_id=%s) — rotating", client_slug, archive_sheet_id)
                 try:
                     archive_sheet_id = _rotate_archive_sheet(conn, ss_client, client_slug, archive_sheet_id, folder_id)
+                    archive_ids.add(archive_sheet_id)
                     stats["rotations"] += 1
                 except ArchiveRouterError as exc:
                     logger.error("Rotation failed for %s: %s — row %s left unarchived, will retry next run",
                                  client_slug, exc, row.id)
+                    stats["rows_failed"] += 1
+                    sheet_incomplete = True
                     continue
 
-                # Retry the move against the newly-rotated sheet. This
-                # writes a second backup_row() entry for the same row —
-                # harmless duplication (backups are cheap insurance, not a
-                # scarce resource), not a bug.
-                move_row(
+                # Retry the move against the newly-rotated sheet (writes a second
+                # backup entry -- harmless duplication).
+                move_log_id = move_row(
                     conn, ss_client,
                     source_sheet_id=sheet_summary.id,
                     source_row=row,
@@ -378,9 +515,25 @@ def process_client_archive(conn, ss_client, sheets_in_folder: list, client_slug:
                     mine_value=None,
                 )
 
-            stats["rows_moved"] += 1
+            if _move_succeeded(conn, move_log_id):
+                stats["rows_moved"] += 1
+            else:
+                stats["rows_failed"] += 1
+                sheet_incomplete = True
+                attempts = _row_failed_attempts(conn, sheet_summary.id, row.id)
+                logger.error("Archive move FAILED for row %s on sheet %s (%s) — attempt %s/%s, move_log_id=%s",
+                              row.id, sheet_summary.id, sheet_summary.name, attempts, MAX_ROW_ATTEMPTS, move_log_id)
+                if attempts == MAX_ROW_ATTEMPTS:
+                    _log_alert(conn,
+                        f"⚠️ *archive_router*: row {row.id} on *{sheet_summary.name}* ({client_slug}) "
+                        f"failed to archive {MAX_ROW_ATTEMPTS} times in 24h. Giving up until it is edited. "
+                        f"See approval_router_row_move_log (move_log_id {move_log_id}).",
+                        severity="warning")
 
-        _update_archive_sheet_state(conn, sheet_summary.id, client_slug, current_version)
+        if sheet_incomplete:
+            stats["sheets_incomplete"] += 1  # do NOT checkpoint: leftover/failed rows are retried next run
+        else:
+            _update_archive_sheet_state(conn, sheet_summary.id, client_slug, current_version)
 
     return stats
 
@@ -426,58 +579,85 @@ def _finish_job_run(conn, job_run_id: int, status: str, rows_processed: int, err
 def main():
     """
     Entry point for cron. Loops every client in INVOICING_FOLDERS, checking
-    every non-archive sheet in that client's folder for Archive-checked
-    rows and moving them. A single client failing entirely is logged and
-    skipped, same "one bad thing doesn't stop the batch" philosophy as
-    route_resolver.py — and the same lock-file/zombie-timeout convention.
+    every non-archive sheet (nested folders included) for Archive-checked
+    rows and moving them. One client failing is logged and skipped.
+
+    Hardened 2026-10-12: Smartsheet request timeouts, a whole-run deadline,
+    a lock heartbeat (stale = 30 min without a heartbeat) and an owner-token
+    lock release, matching route_resolver.py.
     """
+    global _LOCK_TOKEN
     if os.path.exists(LOCK_FILE):
         file_age = time.time() - os.path.getmtime(LOCK_FILE)
-        if file_age > 3600:
-            logger.warning("Zombie lock detected (older than 60 min) — clearing it")
+        if file_age > LOCK_STALE_SECONDS:
+            logger.warning("Zombie lock detected (no heartbeat for %ss) — clearing it", int(file_age))
             os.remove(LOCK_FILE)
         else:
             logger.info("archive_router already running — aborting to avoid overlap")
             return
 
     os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    _LOCK_TOKEN = f"{os.getpid()}-{time.time()}"
     with open(LOCK_FILE, "w") as f:
-        f.write(str(time.time()))
+        f.write(_LOCK_TOKEN)
+
+    signal.signal(signal.SIGALRM, _on_run_deadline)
+    signal.alarm(RUN_MAX_SECONDS)
 
     conn = None
     job_run_id = None
     total_rows_moved = 0
+    total_failed = 0
     start_time = time.time()
 
     try:
         conn = get_connection()
-        ss_client = get_smartsheet_client()
+        ss_client = _apply_request_timeout(get_smartsheet_client())
         job_run_id = _start_job_run(conn, JOB_NAME)
 
         for client_slug, folder_id in INVOICING_FOLDERS.items():
             try:
-                folder = ss_client.Folders.get_folder(folder_id)
-                sheets_in_folder = folder.sheets or []
-                stats = process_client_archive(conn, ss_client, sheets_in_folder, client_slug, folder_id)
+                sheets_in_folder = _collect_sheets(ss_client, folder_id)
+                stats = process_client_archive(conn, ss_client, sheets_in_folder, client_slug, folder_id,
+                                               moves_left=MAX_MOVES_PER_RUN - total_rows_moved)
                 total_rows_moved += stats["rows_moved"]
-                logger.info("Client %s done: %s", client_slug, stats)
+                total_failed += stats["rows_failed"]
+                logger.info("Client %s done (%s sheets scanned incl. sub-folders): %s",
+                             client_slug, len(sheets_in_folder), stats)
             except Exception as exc:
                 logger.error("Client %s failed entirely (skipping to next client): %s", client_slug, exc, exc_info=True)
 
         duration = round(time.time() - start_time, 1)
         _finish_job_run(conn, job_run_id, status="success", rows_processed=total_rows_moved)
-        logger.info("archive_router run complete: %s rows moved across %s clients in %ss",
-                     total_rows_moved, len(INVOICING_FOLDERS), duration)
+        logger.info("archive_router run complete: %s rows moved, %s failed, across %s clients in %ss",
+                     total_rows_moved, total_failed, len(INVOICING_FOLDERS), duration)
 
+    except _RunDeadline as exc:
+        logger.critical("archive_router ABORTED by deadline: %s", exc)
+        if conn and job_run_id:
+            try:
+                _finish_job_run(conn, job_run_id, status="failed", rows_processed=total_rows_moved,
+                                error_message=f"deadline: {exc}")
+            except Exception:
+                pass
     except Exception as exc:
         logger.error("archive_router run failed: %s", exc, exc_info=True)
         if conn and job_run_id:
             _finish_job_run(conn, job_run_id, status="failed", rows_processed=total_rows_moved, error_message=str(exc))
     finally:
+        signal.alarm(0)
         if conn:
-            conn.close()
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            with open(LOCK_FILE) as f:
+                owner_ok = (f.read().strip() == _LOCK_TOKEN)
+            if owner_ok:
+                os.remove(LOCK_FILE)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
