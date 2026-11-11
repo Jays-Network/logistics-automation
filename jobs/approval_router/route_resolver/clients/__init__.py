@@ -21,12 +21,12 @@ to CLIENTS below. Nothing else needs to change.
 """
 
 from . import (alistair, reload_, glencore_international, fh_bertling, bridge, goldvale,
-               gsm, ixm, mittal, sls_africa, sls_trading, zalawi)
+               gsm, ixm, mittal, north_star, sls_africa, sls_trading, zalawi)
 
 # Order = the order clients are processed each run (unchanged from before).
 CLIENTS = {
     m.CLIENT_SLUG: m for m in (
         alistair, reload_, glencore_international, fh_bertling, bridge, goldvale,
-        gsm, ixm, mittal, sls_africa, sls_trading, zalawi,
+        gsm, ixm, mittal, north_star, sls_africa, sls_trading, zalawi,
     )
 }

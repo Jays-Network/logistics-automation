@@ -74,6 +74,10 @@ INVOICING_FOLDERS: dict[str, int] = {
     # approval workflow (not route_resolver), so it is archive-only here.
     # Needs an approval_router_archive_state row (sql/migrations/019).
     "alliance":               6083455994881924,
+    # Added 2026-11-11. New client (DRC -> SA via Zambia/Botswana, Hleza), copy
+    # of Gold Vale's layout. Needs an approval_router_archive_state row
+    # (sql/migrations/019).
+    "north_star":             386498362140548,
 }
 
 
@@ -98,6 +102,7 @@ KNOWN_ARCHIVE_SHEETS: dict[str, tuple[int, str]] = {
     "zalawi":                 (6622194753818500, "ZALAWI Archive"),
     "glencore":               (4364822220066692, "GLENCORE Archive"),
     "alliance":               (7348488238223236, "Arcive Alliance invoicing"),
+    "north_star":             (565923993046916,  "NORTH STAR Archive"),
 }
 
 
