@@ -39,11 +39,6 @@ RELOAD_LOCAL_ROUTE_MAP: dict[str, int] = {
         "reload-sico- kas",
         # Added 2026-10-16 (per Jay): MUMI is Kolwezi.
         "reload-mumi - kas", "reload-mumi - sak",
-        # Added 2026-11-11 (per Jay): HCM - KAS is Kolwezi. The LOCAL ROUTE
-        # picklist option did not exist yet, so the exact live spelling is
-        # unconfirmed -- plausible hyphen/space variants listed (matching is
-        # already case/extra-space tolerant). Not to be confused with HMC - KAS.
-        "reload-hcm - kas", "reload-hcm-kas", "reload-hcm- kas",
     )
 }
 RELOAD_LOCAL_ROUTE_MAP.update({
@@ -61,6 +56,11 @@ RELOAD_LOCAL_ROUTE_MAP.update({
         "reload-kisenda - kas",
         # Added 2026-10-16 (per Jay): KFM is Fungurume.
         "reload-kfm - kas",
+        # Added 2026-11-12 (per Jay): HCM - KAS is Fungurume (first added
+        # 2026-11-11 as Kolwezi by mistake). Not to be confused with HMC - KAS,
+        # which is Kolwezi. Spelling variants listed (matching is already
+        # case/extra-space tolerant).
+        "reload-hcm - kas", "reload-hcm-kas", "reload-hcm- kas",
     )
 })
 RELOAD_LOCAL_ROUTE_MAP.update({
