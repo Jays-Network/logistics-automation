@@ -39,6 +39,12 @@ RELOAD_LOCAL_ROUTE_MAP: dict[str, int] = {
         "reload-sico- kas",
         # Added 2026-10-16 (per Jay): MUMI is Kolwezi.
         "reload-mumi - kas", "reload-mumi - sak",
+        # Added 2026-11-24 (per Jay): MUSONOI is in the Kolwezi area. LOCAL ROUTE
+        # picklist options did not exist yet -- exact spelling unconfirmed, so
+        # plausible hyphen/space variants are listed (matching is already
+        # case/extra-space tolerant).
+        "reload-musonoi-kas", "reload-musonoi - kas", "reload-musonoi- kas",
+        "reload-musonoi-sak", "reload-musonoi - sak", "reload-musonoi- sak",
     )
 }
 RELOAD_LOCAL_ROUTE_MAP.update({
@@ -56,6 +62,10 @@ RELOAD_LOCAL_ROUTE_MAP.update({
         "reload-kisenda - kas",
         # Added 2026-10-16 (per Jay): KFM is Fungurume.
         "reload-kfm - kas",
+        # Added 2026-11-24 (per Jay): JOVI MINE is in the same area as KFM
+        # (Kisanfu) = Fungurume. Spelling variants as above.
+        "reload-jovi mine - kas", "reload-jovi mine-kas", "reload-jovi mine- kas",
+        "reload-jovi mine - sak", "reload-jovi mine-sak", "reload-jovi mine- sak",
         # Added 2026-11-12 (per Jay): HCM - KAS is Fungurume (first added
         # 2026-11-11 as Kolwezi by mistake). Not to be confused with HMC - KAS,
         # which is Kolwezi. Spelling variants listed (matching is already
